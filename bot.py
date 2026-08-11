@@ -22,7 +22,6 @@ RULES_CHANNEL = "📜・rules"
 VERIFY_CHANNEL = "✅・verification"
 GENERAL_CHANNEL = "💬・general"
 MOD_LOG_CHANNEL = "🛡️・mod-logs"
-
 SHARED_MODS_CHANNEL = "🧩・shared-mods"
 
 
@@ -30,14 +29,12 @@ SHARED_MODS_CHANNEL = "🧩・shared-mods"
 # COOLDOWNS
 # =========================================================
 
-# General chat
 GENERAL_SLOWMODE = 10
 
-# Shared Mods:
-# 600 seconds = 10 minutes between NEW mod posts
+# 10 minutes between new Shared Mods posts
 MOD_POST_COOLDOWN = 600
 
-# 10 seconds between comments inside a mod post
+# 10 seconds between comments in Shared Mods
 MOD_COMMENT_SLOWMODE = 10
 
 
@@ -45,11 +42,10 @@ MOD_COMMENT_SLOWMODE = 10
 # MODERATION
 # =========================================================
 
+# Bad language timeout
 BAD_WORD_TIMEOUT = 30
 
-REPEAT_TIMEOUT = 10
-REPEAT_LIMIT = 3
-
+# Fast spam protection
 SPAM_TIMEOUT = 10
 SPAM_MESSAGE_LIMIT = 6
 SPAM_WINDOW_SECONDS = 8
@@ -86,18 +82,17 @@ client = discord.Client(
     intents=intents
 )
 
-tree = app_commands.CommandTree(client)
+tree = app_commands.CommandTree(
+    client
+)
 
 
 # =========================================================
 # MEMORY
 # =========================================================
 
-recent_messages = defaultdict(
-    lambda: deque(
-        maxlen=REPEAT_LIMIT
-    )
-)
+# Used only for FAST spam.
+# Same-message-repeat detection has been removed.
 
 message_times = defaultdict(
     deque
@@ -124,8 +119,7 @@ BAD_PHRASES = [
 ]
 
 
-# Common spellings / obfuscations of racial slur
-
+# Detect common forms of a racial slur
 NWORD_PATTERN = re.compile(
     r"\bn[\W_]*[i1!][\W_]*g[\W_]*g[\W_]*"
     r"[e3a@][\W_]*r?s?\b",
@@ -134,7 +128,6 @@ NWORD_PATTERN = re.compile(
 
 
 # Discord invites
-
 INVITE_PATTERN = re.compile(
     r"(?:https?://)?"
     r"(?:www\.)?"
@@ -145,7 +138,6 @@ INVITE_PATTERN = re.compile(
 
 
 # GIF links
-
 GIF_PATTERN = re.compile(
     r"(?:https?://\S+\.gif(?:\?\S*)?$)|"
     r"(?:https?://)?"
@@ -157,7 +149,6 @@ GIF_PATTERN = re.compile(
 
 
 # Any URL
-
 URL_PATTERN = re.compile(
     r"https?://\S+",
     re.IGNORECASE
@@ -167,19 +158,6 @@ URL_PATTERN = re.compile(
 # =========================================================
 # HELPERS
 # =========================================================
-
-def normalize_text(text):
-
-    text = text.lower().strip()
-
-    text = re.sub(
-        r"\s+",
-        " ",
-        text
-    )
-
-    return text
-
 
 def contains_bad_language(text):
 
@@ -316,7 +294,7 @@ async def mod_log(
 
 
 # =========================================================
-# SPAM CHECK
+# FAST SPAM CHECK
 # =========================================================
 
 async def check_spam(
@@ -376,8 +354,11 @@ async def check_spam(
             await warning_message(
                 message.channel,
                 member,
-                "⚠️ Spam detected. "
-                "You have been timed out for **10 minutes**."
+                (
+                    "⚠️ Spam detected. "
+                    "You have been timed out for "
+                    "**10 minutes**."
+                )
             )
 
         await mod_log(
@@ -394,67 +375,8 @@ async def check_spam(
         return True
 
 
-    # =====================================================
-    # REPEATED COPY-PASTE
-    # =====================================================
-
-    text = normalize_text(
-        message.content or ""
-    )
-
-    if not text:
-        return False
-
-
-    history = recent_messages[key]
-
-    history.append(
-        text
-    )
-
-
-    if (
-        len(history) == REPEAT_LIMIT
-        and len(set(history)) == 1
-    ):
-
-        history.clear()
-
-        await delete_message(
-            message
-        )
-
-        success = await timeout_member(
-            member,
-            REPEAT_TIMEOUT,
-            "Repeated the same message 3 times"
-        )
-
-        if success:
-
-            await warning_message(
-                message.channel,
-                member,
-                (
-                    "⚠️ **Warning:** you sent the same "
-                    "message 3 times in a row.\n"
-                    "You have been timed out for "
-                    "**10 minutes**."
-                )
-            )
-
-        await mod_log(
-            guild,
-            "⚠️ Copy-paste spam",
-            (
-                f"User: {member.mention}\n"
-                "Reason: same message 3 times in a row\n"
-                f"Timeout: {REPEAT_TIMEOUT} minutes"
-            )
-        )
-
-        return True
-
+    # IMPORTANT:
+    # There is NO same-message-3-times timeout anymore.
 
     return False
 
@@ -478,7 +400,7 @@ class VerifyView(
         label="Verify",
         emoji="✅",
         style=discord.ButtonStyle.green,
-        custom_id="ssp_verify_button_v4"
+        custom_id="ssp_verify_button_v5"
     )
     async def verify_button(
         self,
@@ -692,8 +614,7 @@ async def on_message(
     member = message.author
 
 
-    # Staff bypass filters
-
+    # Staff bypass moderation
     if is_staff(member):
         return
 
@@ -752,12 +673,15 @@ async def on_message(
             and parent.name == SHARED_MODS_CHANNEL
         ):
 
+            text = message.content or ""
+
+
             # =============================================
             # BAD LANGUAGE
             # =============================================
 
             if contains_bad_language(
-                message.content or ""
+                text
             ):
 
                 await delete_message(
@@ -800,7 +724,7 @@ async def on_message(
             # =============================================
 
             if INVITE_PATTERN.search(
-                message.content or ""
+                text
             ):
 
                 await delete_message(
@@ -821,7 +745,7 @@ async def on_message(
             # =============================================
 
             if URL_PATTERN.search(
-                message.content or ""
+                text
             ):
 
                 await delete_message(
@@ -841,10 +765,7 @@ async def on_message(
 
 
             # =============================================
-            # STARTER MESSAGE
-            #
-            # Forum starter message ID matches thread ID.
-            # It MUST contain exactly one file.
+            # STARTER POST
             # =============================================
 
             starter_message = (
@@ -854,6 +775,8 @@ async def on_message(
 
 
             if starter_message:
+
+                # Every new mod post must have exactly 1 file
 
                 if len(
                     message.attachments
@@ -877,7 +800,7 @@ async def on_message(
                         (
                             f"User: {member.mention}\n"
                             f"Post: {message.channel.name}\n"
-                            "Reason: post did not contain exactly one file"
+                            "Reason: did not contain exactly one file"
                         )
                     )
 
@@ -886,7 +809,8 @@ async def on_message(
 
                         await message.channel.delete(
                             reason=(
-                                "Shared Mods posts require exactly one file"
+                                "Shared Mods posts require "
+                                "exactly one file"
                             )
                         )
 
@@ -899,7 +823,7 @@ async def on_message(
 
 
             # =============================================
-            # REPLIES CANNOT CONTAIN EXTRA FILES
+            # REPLIES = TEXT ONLY
             # =============================================
 
             else:
@@ -914,8 +838,9 @@ async def on_message(
                         message.channel,
                         member,
                         (
-                            "⚠️ Only the original mod post may "
-                            "contain a file. Replies are text-only."
+                            "⚠️ Only the original mod post "
+                            "may contain a file. "
+                            "Replies are text-only."
                         )
                     )
 
@@ -923,7 +848,7 @@ async def on_message(
 
 
             # =============================================
-            # SPAM PROTECTION
+            # FAST SPAM ONLY
             # =============================================
 
             spammed = await check_spam(
@@ -938,9 +863,9 @@ async def on_message(
             return
 
 
-    # =========================================================
+    # =====================================================
     # GENERAL
-    # =========================================================
+    # =====================================================
 
     if general is None:
         return
@@ -1103,7 +1028,7 @@ async def on_message(
 
 
     # =====================================================
-    # SPAM
+    # FAST SPAM ONLY
     # =====================================================
 
     spammed = await check_spam(
@@ -1308,7 +1233,7 @@ async def setup(
 
 
     # =====================================================
-    # PERMISSION CHECK
+    # BOT PERMISSIONS
     # =====================================================
 
     permissions = bot_member.guild_permissions
@@ -1317,24 +1242,28 @@ async def setup(
 
 
     if not permissions.manage_channels:
+
         missing.append(
             "Manage Channels"
         )
 
 
     if not permissions.manage_roles:
+
         missing.append(
             "Manage Roles"
         )
 
 
     if not permissions.manage_messages:
+
         missing.append(
             "Manage Messages"
         )
 
 
     if not permissions.moderate_members:
+
         missing.append(
             "Moderate Members"
         )
@@ -1388,7 +1317,7 @@ async def setup(
 
 
     # =====================================================
-    # NORMAL CHANNELS
+    # CHANNELS
     # =====================================================
 
     rules = await guild.create_text_channel(
@@ -1419,13 +1348,6 @@ async def setup(
     # =====================================================
     # SHARED MODS FORUM
     # =====================================================
-    #
-    # slowmode_delay=600:
-    # one new forum post every 10 minutes
-    #
-    # default_thread_slowmode_delay=10:
-    # 10 seconds between messages in each post
-    #
 
     forum_overwrites = {
 
@@ -1454,8 +1376,7 @@ async def setup(
 
         topic=(
             "⚠️ WARNING: Do not automatically trust every mod "
-            "shared here. Files are uploaded by community members. "
-            "Only download files you are comfortable using."
+            "shared here. Files are uploaded by community members."
         ),
 
         slowmode_delay=MOD_POST_COOLDOWN,
@@ -1486,7 +1407,7 @@ async def setup(
 
 
     # =====================================================
-    # VERIFY PERMISSIONS
+    # VERIFICATION PERMISSIONS
     # =====================================================
 
     await verify.set_permissions(
@@ -1533,7 +1454,7 @@ async def setup(
 
 
     # =====================================================
-    # MOD LOGS
+    # MOD LOG PERMISSIONS
     # =====================================================
 
     await logs.set_permissions(
@@ -1558,8 +1479,7 @@ async def setup(
         description=(
             "Welcome to **SSP Modding Hub!**\n\n"
 
-            "• No spam.\n"
-            "• No repeated copy-paste messages.\n"
+            "• No fast spam.\n"
             "• No GIFs, files, or images in general.\n"
             "• No Discord invites in general.\n"
             "• No links in general.\n"
@@ -1589,7 +1509,7 @@ async def setup(
 
 
     # =====================================================
-    # VERIFICATION MESSAGE
+    # VERIFY MESSAGE
     # =====================================================
 
     verify_embed = discord.Embed(
@@ -1626,18 +1546,22 @@ async def setup(
             name="⚠️ READ BEFORE DOWNLOADING MODS",
 
             content=(
-                "⚠️ **DO NOT TRUST EVERY MOD SHARED HERE**\n\n"
+                "⚠️ **DON'T TRUST EVERY MOD SHARED HERE**\n\n"
+
                 "Mods in this forum are uploaded by community members. "
-                "SSP Modding Hub does not automatically guarantee that "
-                "every uploaded file is safe.\n\n"
-                "Only download and run files you are comfortable using.\n\n"
+                "SSP Modding Hub does not guarantee that every uploaded "
+                "file is safe.\n\n"
+
+                "Only download and run files you trust.\n\n"
+
                 "**Posting rules:**\n"
                 "• One mod post every 10 minutes\n"
                 "• Exactly one file per new mod post\n"
                 "• Give your post a clear name/title\n"
                 "• Replies are text-only\n"
-                "• No spam\n"
-                "• No Discord invites or external download links"
+                "• No fast spam\n"
+                "• No Discord invites\n"
+                "• No external download links"
             )
         )
 
@@ -1662,14 +1586,10 @@ async def setup(
             "📜 `rules`\n"
             "✅ `verification`\n"
             "💬 `general`\n"
-            "🧩 `shared-mods` **Forum**\n"
+            "🧩 `shared-mods`\n"
             "🛡️ `mod-logs`\n\n"
 
-            "Shared Mods:\n"
-            "📁 Exactly 1 file per mod post\n"
-            "⏱️ 10 minutes between new mod posts\n"
-            "💬 10 seconds between comments\n"
-            "🔒 Verified members only\n\n"
+            "There is NO same-message-3-times timeout anymore.\n\n"
 
             "Run `/showsetup` when ready."
         ),
@@ -1865,9 +1785,11 @@ async def showsetup(
     await interaction.response.send_message(
         (
             "✅ Verification is open.\n\n"
+
             "Before verification:\n"
             "📜 Rules\n"
             "✅ Verification\n\n"
+
             "After verification:\n"
             "💬 General\n"
             "🧩 Shared Mods"
