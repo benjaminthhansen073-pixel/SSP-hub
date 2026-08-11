@@ -632,7 +632,7 @@ async def on_app_command_error(
 if __name__ == "__main__":
     if not TOKEN:
         raise RuntimeError(
-            "DISCORD_BOT_TOKEN is missing. "
+            " is missing. "
             "Add it as an environment variable in Railway."
         )
 
