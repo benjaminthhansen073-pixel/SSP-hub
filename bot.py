@@ -1,6 +1,12 @@
 import os
+import re
+import asyncio
+from collections import defaultdict, deque
+from datetime import timedelta
+
 import discord
 from discord import app_commands
+
 
 # =========================================================
 # SETTINGS
@@ -8,20 +14,259 @@ from discord import app_commands
 
 TOKEN = os.getenv("DISCORD_BOT_TOKEN")
 
-VERIFIED_ROLE_NAME = "Verified"
+VERIFIED_ROLE = "Verified"
+
 CATEGORY_NAME = "✅ VERIFICATION"
-RULES_CHANNEL_NAME = "📜・rules"
-VERIFY_CHANNEL_NAME = "✅・verification"
-GENERAL_CHANNEL_NAME = "💬・general"
+RULES_CHANNEL = "📜・rules"
+VERIFY_CHANNEL = "✅・verification"
+GENERAL_CHANNEL = "💬・general"
+MOD_LOG_CHANNEL = "🛡️・mod-logs"
+
+GENERAL_SLOWMODE = 10
+
+BAD_WORD_TIMEOUT = 30
+REPEAT_TIMEOUT = 10
+SPAM_TIMEOUT = 10
+
+REPEAT_LIMIT = 3
+
+SPAM_MESSAGE_LIMIT = 6
+SPAM_WINDOW_SECONDS = 8
+
+RAID_JOIN_LIMIT = 6
+RAID_JOIN_WINDOW = 10
+
+NEW_ACCOUNT_HOURS = 24
+
 
 # =========================================================
-# DISCORD CLIENT
+# INTENTS
 # =========================================================
+#
+# Discord Developer Portal -> Bot:
+#
+# SERVER MEMBERS INTENT     = ON
+# MESSAGE CONTENT INTENT    = ON
+# PRESENCE INTENT           = OFF
+#
 
 intents = discord.Intents.default()
 
-client = discord.Client(intents=intents)
+intents.members = True
+intents.message_content = True
+
+
+client = discord.Client(
+    intents=intents
+)
+
 tree = app_commands.CommandTree(client)
+
+
+# =========================================================
+# MODERATION MEMORY
+# =========================================================
+
+recent_messages = defaultdict(
+    lambda: deque(maxlen=REPEAT_LIMIT)
+)
+
+message_times = defaultdict(deque)
+
+recent_joins = deque()
+
+raid_lockdowns = set()
+
+view_registered = False
+
+
+# =========================================================
+# BAD LANGUAGE
+# =========================================================
+#
+# Add more words or phrases here.
+#
+
+BAD_PHRASES = [
+    "fuck",
+    "kill yourself",
+    "go kill yourself",
+    "kys",
+    "go kys",
+    "retard",
+]
+
+
+# Detects common versions of the n-word
+# without writing the full slur directly.
+
+NWORD_PATTERN = re.compile(
+    r"\bn[\W_]*[i1!][\W_]*g[\W_]*g[\W_]*[e3a@][\W_]*r?s?\b",
+    re.IGNORECASE
+)
+
+
+# Discord invites
+
+INVITE_PATTERN = re.compile(
+    r"(?:https?://)?"
+    r"(?:www\.)?"
+    r"(?:discord\.gg|discord(?:app)?\.com/invite)"
+    r"/[A-Za-z0-9-]+",
+    re.IGNORECASE
+)
+
+
+# GIF links
+
+GIF_PATTERN = re.compile(
+    r"(?:https?://\S+\.gif(?:\?\S*)?$)|"
+    r"(?:https?://)?(?:www\.)?"
+    r"(?:tenor\.com|giphy\.com|media\.giphy\.com)/\S+",
+    re.IGNORECASE
+)
+
+
+# Any other web link
+
+URL_PATTERN = re.compile(
+    r"https?://\S+",
+    re.IGNORECASE
+)
+
+
+# =========================================================
+# HELPERS
+# =========================================================
+
+def normalize_text(text):
+
+    text = text.lower().strip()
+
+    text = re.sub(
+        r"\s+",
+        " ",
+        text
+    )
+
+    return text
+
+
+def bad_language(text):
+
+    text_lower = text.lower()
+
+    if NWORD_PATTERN.search(text):
+        return True
+
+    for phrase in BAD_PHRASES:
+
+        if phrase in text_lower:
+            return True
+
+    return False
+
+
+def is_staff(member):
+
+    permissions = member.guild_permissions
+
+    return (
+        permissions.administrator
+        or permissions.manage_guild
+        or permissions.manage_messages
+        or permissions.moderate_members
+    )
+
+
+async def delete_message(message):
+
+    try:
+
+        await message.delete()
+
+    except (
+        discord.Forbidden,
+        discord.NotFound
+    ):
+
+        pass
+
+
+async def send_warning(
+    channel,
+    member,
+    text
+):
+
+    try:
+
+        warning = await channel.send(
+            f"{member.mention} {text}"
+        )
+
+        await asyncio.sleep(6)
+
+        await warning.delete()
+
+    except Exception:
+
+        pass
+
+
+async def timeout_member(
+    member,
+    minutes,
+    reason
+):
+
+    try:
+
+        await member.timeout(
+            timedelta(minutes=minutes),
+            reason=reason
+        )
+
+        return True
+
+    except discord.Forbidden:
+
+        return False
+
+    except discord.HTTPException:
+
+        return False
+
+
+async def mod_log(
+    guild,
+    title,
+    text
+):
+
+    channel = discord.utils.get(
+        guild.text_channels,
+        name=MOD_LOG_CHANNEL
+    )
+
+    if channel is None:
+        return
+
+    embed = discord.Embed(
+        title=title,
+        description=text,
+        color=discord.Color.orange()
+    )
+
+    try:
+
+        await channel.send(
+            embed=embed
+        )
+
+    except discord.Forbidden:
+
+        pass
 
 
 # =========================================================
@@ -29,127 +274,645 @@ tree = app_commands.CommandTree(client)
 # =========================================================
 
 class VerifyView(discord.ui.View):
+
     def __init__(self):
-        super().__init__(timeout=None)
+
+        super().__init__(
+            timeout=None
+        )
+
 
     @discord.ui.button(
         label="Verify",
         emoji="✅",
         style=discord.ButtonStyle.green,
-        custom_id="ssp_verify_button_v1"
+        custom_id="ssp_verify_button_v3"
     )
     async def verify_button(
         self,
-        interaction: discord.Interaction,
-        button: discord.ui.Button
+        interaction,
+        button
     ):
+
         guild = interaction.guild
 
         if guild is None:
+
             await interaction.response.send_message(
                 "❌ Verification only works inside the server.",
                 ephemeral=True
             )
+
             return
+
 
         member = interaction.user
 
-        if not isinstance(member, discord.Member):
-            await interaction.response.send_message(
-                "❌ I couldn't identify your server member account.",
-                ephemeral=True
-            )
+
+        if not isinstance(
+            member,
+            discord.Member
+        ):
+
             return
 
-        verified_role = discord.utils.get(
+
+        role = discord.utils.get(
             guild.roles,
-            name=VERIFIED_ROLE_NAME
+            name=VERIFIED_ROLE
         )
 
-        if verified_role is None:
+
+        if role is None:
+
             await interaction.response.send_message(
-                "❌ The Verified role is missing. Ask an administrator to run `/setup`.",
+                "❌ Verified role is missing.",
                 ephemeral=True
             )
+
             return
 
-        if verified_role in member.roles:
+
+        if role in member.roles:
+
             await interaction.response.send_message(
-                "✅ You are already verified!",
+                "✅ You are already verified.",
                 ephemeral=True
             )
+
             return
+
+
+        # =============================================
+        # RAID PROTECTION
+        # =============================================
+
+        if guild.id in raid_lockdowns:
+
+            account_age = (
+                discord.utils.utcnow()
+                - member.created_at
+            )
+
+            if account_age < timedelta(
+                hours=NEW_ACCOUNT_HOURS
+            ):
+
+                await interaction.response.send_message(
+                    "🛡️ The server is currently under raid protection.\n\n"
+                    "Very new accounts cannot verify right now.",
+                    ephemeral=True
+                )
+
+                return
+
 
         bot_member = guild.me
 
+
         if bot_member is None:
-            await interaction.response.send_message(
-                "❌ I couldn't check my server permissions.",
-                ephemeral=True
-            )
+
             return
 
-        if verified_role >= bot_member.top_role:
+
+        if role >= bot_member.top_role:
+
             await interaction.response.send_message(
-                "❌ I can't give you the Verified role because my bot role is not above it.\n"
-                "An admin needs to move my bot role above `Verified` in Server Settings → Roles.",
+                "❌ My bot role needs to be ABOVE the Verified role.",
                 ephemeral=True
             )
+
             return
+
 
         try:
+
             await member.add_roles(
-                verified_role,
-                reason="SSP verification button"
+                role,
+                reason="SSP verification"
             )
 
+
             await interaction.response.send_message(
-                "✅ **You are verified!**\n"
-                "You now have access to `💬・general`.",
+                "✅ **Verified!**\n\n"
+                "You can now access `💬・general`.",
                 ephemeral=True
             )
+
 
         except discord.Forbidden:
-            await interaction.response.send_message(
-                "❌ Discord blocked me from giving the role.\n"
-                "Make sure I have **Manage Roles** and my bot role is above `Verified`.",
-                ephemeral=True
-            )
-
-        except Exception as error:
-            print("VERIFY ERROR:", repr(error))
 
             await interaction.response.send_message(
-                "❌ Verification failed. Please tell an administrator.",
+                "❌ I need Manage Roles permission.",
                 ephemeral=True
             )
 
 
 # =========================================================
-# READY EVENT
+# READY
 # =========================================================
 
 @client.event
 async def on_ready():
-    # Makes the verify button keep working after restarts.
-    client.add_view(VerifyView())
+
+    global view_registered
+
+
+    if not view_registered:
+
+        client.add_view(
+            VerifyView()
+        )
+
+        view_registered = True
+
 
     print("")
-    print("==========================================")
-    print("✅ SSP MODDING HUB BOT IS ONLINE")
-    print("==========================================")
-    print(f"Bot: {client.user}")
-    print(f"Bot ID: {client.user.id}")
-    print(f"Servers: {len(client.guilds)}")
+    print("====================================")
+    print("✅ SSP MODDING HUB BOT ONLINE")
+    print("====================================")
+
+    print(
+        "Bot:",
+        client.user
+    )
+
+    print(
+        "Servers:",
+        len(client.guilds)
+    )
+
 
     try:
-        synced = await tree.sync()
-        print(f"Slash commands synced: {len(synced)}")
-    except Exception as error:
-        print("COMMAND SYNC ERROR:", repr(error))
 
-    print("==========================================")
+        synced = await tree.sync()
+
+        print(
+            "Commands:",
+            len(synced)
+        )
+
+    except Exception as error:
+
+        print(
+            "SYNC ERROR:",
+            repr(error)
+        )
+
+
+    print("====================================")
     print("")
+
+
+# =========================================================
+# MESSAGE MODERATION
+# =========================================================
+
+@client.event
+async def on_message(message):
+
+    # Ignore DMs
+
+    if message.guild is None:
+        return
+
+
+    # Ignore bots
+
+    if message.author.bot:
+        return
+
+
+    if not isinstance(
+        message.author,
+        discord.Member
+    ):
+
+        return
+
+
+    guild = message.guild
+    member = message.author
+
+
+    # Staff bypass filters
+
+    if is_staff(member):
+        return
+
+
+    rules = discord.utils.get(
+        guild.text_channels,
+        name=RULES_CHANNEL
+    )
+
+
+    verification = discord.utils.get(
+        guild.text_channels,
+        name=VERIFY_CHANNEL
+    )
+
+
+    general = discord.utils.get(
+        guild.text_channels,
+        name=GENERAL_CHANNEL
+    )
+
+
+    # =====================================================
+    # RULES / VERIFICATION
+    # =====================================================
+
+    # Members should not be able to send anything here.
+    # This is also enforced with channel permissions.
+
+    if message.channel in (
+        rules,
+        verification
+    ):
+
+        await delete_message(
+            message
+        )
+
+        return
+
+
+    # Only moderate our general channel
+
+    if general is None:
+        return
+
+
+    if message.channel.id != general.id:
+        return
+
+
+    text = message.content or ""
+
+
+    # =====================================================
+    # TEXT ONLY
+    # =====================================================
+
+    if message.attachments:
+
+        await delete_message(
+            message
+        )
+
+        await send_warning(
+            message.channel,
+            member,
+            "⚠️ General is **text only**. Files and images are not allowed."
+        )
+
+        return
+
+
+    # =====================================================
+    # STICKERS
+    # =====================================================
+
+    if message.stickers:
+
+        await delete_message(
+            message
+        )
+
+        await send_warning(
+            message.channel,
+            member,
+            "⚠️ Stickers are not allowed."
+        )
+
+        return
+
+
+    # =====================================================
+    # GIFS
+    # =====================================================
+
+    if GIF_PATTERN.search(text):
+
+        await delete_message(
+            message
+        )
+
+        await send_warning(
+            message.channel,
+            member,
+            "⚠️ GIFs are not allowed."
+        )
+
+        return
+
+
+    # =====================================================
+    # DISCORD INVITES
+    # =====================================================
+
+    if INVITE_PATTERN.search(text):
+
+        await delete_message(
+            message
+        )
+
+        await send_warning(
+            message.channel,
+            member,
+            "⚠️ Discord invites are not allowed."
+        )
+
+        return
+
+
+    # =====================================================
+    # OTHER LINKS
+    # =====================================================
+
+    if URL_PATTERN.search(text):
+
+        await delete_message(
+            message
+        )
+
+        await send_warning(
+            message.channel,
+            member,
+            "⚠️ Links are not allowed in general."
+        )
+
+        return
+
+
+    # =====================================================
+    # BAD LANGUAGE
+    # 30 MIN TIMEOUT
+    # =====================================================
+
+    if bad_language(text):
+
+        await delete_message(
+            message
+        )
+
+
+        success = await timeout_member(
+            member,
+            BAD_WORD_TIMEOUT,
+            "Prohibited language / harassment"
+        )
+
+
+        if success:
+
+            await send_warning(
+                message.channel,
+                member,
+                "🚫 Prohibited language is not allowed. "
+                "You have been timed out for **30 minutes**."
+            )
+
+
+        await mod_log(
+            guild,
+            "🚫 30-minute timeout",
+            (
+                f"User: {member.mention}\n"
+                f"Reason: prohibited language / harassment\n"
+                f"Channel: {message.channel.mention}"
+            )
+        )
+
+        return
+
+
+    # =====================================================
+    # FAST SPAM
+    # =====================================================
+
+    now = discord.utils.utcnow()
+
+    times = message_times[
+        member.id
+    ]
+
+    times.append(
+        now
+    )
+
+
+    cutoff = now - timedelta(
+        seconds=SPAM_WINDOW_SECONDS
+    )
+
+
+    while (
+        times
+        and times[0] < cutoff
+    ):
+
+        times.popleft()
+
+
+    if len(times) >= SPAM_MESSAGE_LIMIT:
+
+        times.clear()
+
+
+        await delete_message(
+            message
+        )
+
+
+        success = await timeout_member(
+            member,
+            SPAM_TIMEOUT,
+            "Message spam"
+        )
+
+
+        if success:
+
+            await send_warning(
+                message.channel,
+                member,
+                "⚠️ Spam detected. "
+                "You have been timed out for **10 minutes**."
+            )
+
+
+        await mod_log(
+            guild,
+            "⚠️ Spam timeout",
+            (
+                f"User: {member.mention}\n"
+                f"Reason: sent {SPAM_MESSAGE_LIMIT}+ messages "
+                f"in {SPAM_WINDOW_SECONDS} seconds"
+            )
+        )
+
+        return
+
+
+    # =====================================================
+    # SAME MESSAGE 3 TIMES
+    # =====================================================
+
+    normalized = normalize_text(
+        text
+    )
+
+
+    if normalized:
+
+        history = recent_messages[
+            member.id
+        ]
+
+
+        history.append(
+            normalized
+        )
+
+
+        if (
+            len(history) == REPEAT_LIMIT
+            and len(set(history)) == 1
+        ):
+
+            history.clear()
+
+
+            await delete_message(
+                message
+            )
+
+
+            success = await timeout_member(
+                member,
+                REPEAT_TIMEOUT,
+                "Repeated same message 3 times"
+            )
+
+
+            if success:
+
+                await send_warning(
+                    message.channel,
+                    member,
+                    "⚠️ **Warning:** you sent the same message "
+                    "3 times in a row.\n"
+                    "You have been timed out for **10 minutes**."
+                )
+
+
+            await mod_log(
+                guild,
+                "⚠️ Copy-paste spam",
+                (
+                    f"User: {member.mention}\n"
+                    "Reason: same message 3 times in a row\n"
+                    "Timeout: 10 minutes"
+                )
+            )
+
+            return
+
+
+# =========================================================
+# RAID DETECTION
+# =========================================================
+
+@client.event
+async def on_member_join(member):
+
+    now = discord.utils.utcnow()
+
+
+    recent_joins.append(
+        now
+    )
+
+
+    cutoff = now - timedelta(
+        seconds=RAID_JOIN_WINDOW
+    )
+
+
+    while (
+        recent_joins
+        and recent_joins[0] < cutoff
+    ):
+
+        recent_joins.popleft()
+
+
+    if len(recent_joins) < RAID_JOIN_LIMIT:
+        return
+
+
+    guild = member.guild
+
+
+    if guild.id in raid_lockdowns:
+        return
+
+
+    raid_lockdowns.add(
+        guild.id
+    )
+
+
+    general = discord.utils.get(
+        guild.text_channels,
+        name=GENERAL_CHANNEL
+    )
+
+
+    verified = discord.utils.get(
+        guild.roles,
+        name=VERIFIED_ROLE
+    )
+
+
+    if (
+        general is not None
+        and verified is not None
+    ):
+
+        try:
+
+            overwrite = general.overwrites_for(
+                verified
+            )
+
+            overwrite.view_channel = True
+            overwrite.send_messages = False
+
+
+            await general.set_permissions(
+                verified,
+                overwrite=overwrite,
+                reason="Automatic raid lockdown"
+            )
+
+        except discord.Forbidden:
+
+            pass
+
+
+    await mod_log(
+        guild,
+        "🚨 RAID DETECTED",
+        (
+            f"{RAID_JOIN_LIMIT}+ accounts joined "
+            f"within {RAID_JOIN_WINDOW} seconds.\n\n"
+            "`general` has automatically been locked.\n\n"
+            "Staff can use `/unlock` when it is safe."
+        )
+    )
 
 
 # =========================================================
@@ -160,8 +923,14 @@ async def on_ready():
     name="ping",
     description="Check if the SSP bot is online"
 )
-async def ping(interaction: discord.Interaction):
-    latency = round(client.latency * 1000)
+async def ping(
+    interaction
+):
+
+    latency = round(
+        client.latency * 1000
+    )
+
 
     await interaction.response.send_message(
         f"🏓 Pong! `{latency}ms`",
@@ -175,199 +944,321 @@ async def ping(interaction: discord.Interaction):
 
 @tree.command(
     name="setup",
-    description="Create the SSP verification system"
+    description="Create verification and moderation"
 )
-@app_commands.checks.has_permissions(administrator=True)
-async def setup(interaction: discord.Interaction):
+@app_commands.checks.has_permissions(
+    administrator=True
+)
+async def setup(
+    interaction
+):
+
     guild = interaction.guild
 
+
     if guild is None:
+
         await interaction.response.send_message(
-            "❌ Use this command inside your server.",
+            "❌ Use this inside your server.",
             ephemeral=True
         )
+
         return
 
-    await interaction.response.defer(ephemeral=True)
 
-    existing_category = discord.utils.get(
+    await interaction.response.defer(
+        ephemeral=True
+    )
+
+
+    # =====================================================
+    # CHECK EXISTING SETUP
+    # =====================================================
+
+    existing = discord.utils.get(
         guild.categories,
         name=CATEGORY_NAME
     )
 
-    if existing_category:
+
+    if existing:
+
         await interaction.followup.send(
-            "⚠️ The verification setup already exists.\n"
-            "Delete the old `✅ VERIFICATION` category first if you want to rebuild it.",
+            "⚠️ The setup already exists.\n\n"
+            "Delete the old `✅ VERIFICATION` category "
+            "before running `/setup` again.",
             ephemeral=True
         )
+
         return
+
 
     bot_member = guild.me
 
-    if bot_member is None:
+
+    # =====================================================
+    # CHECK BOT PERMISSIONS
+    # =====================================================
+
+    permissions = bot_member.guild_permissions
+
+
+    missing = []
+
+
+    if not permissions.manage_channels:
+
+        missing.append(
+            "Manage Channels"
+        )
+
+
+    if not permissions.manage_roles:
+
+        missing.append(
+            "Manage Roles"
+        )
+
+
+    if not permissions.manage_messages:
+
+        missing.append(
+            "Manage Messages"
+        )
+
+
+    if not permissions.moderate_members:
+
+        missing.append(
+            "Moderate Members"
+        )
+
+
+    if missing:
+
         await interaction.followup.send(
-            "❌ I couldn't read my own server permissions.",
+            "❌ I am missing:\n\n"
+            + "\n".join(
+                f"• {permission}"
+                for permission in missing
+            ),
             ephemeral=True
         )
+
         return
 
-    required = bot_member.guild_permissions
 
-    if not required.manage_channels:
-        await interaction.followup.send(
-            "❌ I need **Manage Channels** permission before `/setup` can work.",
-            ephemeral=True
-        )
-        return
+    # =====================================================
+    # VERIFIED ROLE
+    # =====================================================
 
-    if not required.manage_roles:
-        await interaction.followup.send(
-            "❌ I need **Manage Roles** permission before `/setup` can work.",
-            ephemeral=True
-        )
-        return
-
-    verified_role = discord.utils.get(
+    verified = discord.utils.get(
         guild.roles,
-        name=VERIFIED_ROLE_NAME
+        name=VERIFIED_ROLE
     )
 
-    if verified_role is None:
-        verified_role = await guild.create_role(
-            name=VERIFIED_ROLE_NAME,
-            reason="SSP verification system"
+
+    if verified is None:
+
+        verified = await guild.create_role(
+            name=VERIFIED_ROLE,
+            reason="SSP verification"
         )
+
 
     everyone = guild.default_role
 
-    category_overwrites = {
-        everyone: discord.PermissionOverwrite(
-            view_channel=False
-        ),
-        bot_member: discord.PermissionOverwrite(
-            view_channel=True,
-            send_messages=True,
-            manage_channels=True,
-            read_message_history=True
-        )
-    }
+
+    # =====================================================
+    # CATEGORY
+    # =====================================================
 
     category = await guild.create_category(
-        name=CATEGORY_NAME,
-        overwrites=category_overwrites,
-        reason="SSP verification system"
+        CATEGORY_NAME,
+        reason="SSP setup"
     )
 
-    rules_channel = await guild.create_text_channel(
-        name=RULES_CHANNEL_NAME,
+
+    # =====================================================
+    # CHANNELS
+    # =====================================================
+
+    rules = await guild.create_text_channel(
+        RULES_CHANNEL,
+        category=category
+    )
+
+
+    verify = await guild.create_text_channel(
+        VERIFY_CHANNEL,
+        category=category
+    )
+
+
+    general = await guild.create_text_channel(
+        GENERAL_CHANNEL,
         category=category,
-        reason="SSP verification system"
+        slowmode_delay=GENERAL_SLOWMODE
     )
 
-    verify_channel = await guild.create_text_channel(
-        name=VERIFY_CHANNEL_NAME,
-        category=category,
-        reason="SSP verification system"
+
+    logs = await guild.create_text_channel(
+        MOD_LOG_CHANNEL,
+        category=category
     )
 
-    general_channel = await guild.create_text_channel(
-        name=GENERAL_CHANNEL_NAME,
-        category=category,
-        slowmode_delay=10,
-        reason="SSP verification system"
-    )
 
-    # Unverified users cannot see any of these until /showsetup.
-    await rules_channel.set_permissions(
+    # =====================================================
+    # RULES PERMISSIONS
+    # =====================================================
+
+    await rules.set_permissions(
         everyone,
+
+        view_channel=False,
+        send_messages=False,
+        add_reactions=False,
+
+        create_public_threads=False,
+        create_private_threads=False,
+        send_messages_in_threads=False
+    )
+
+
+    # =====================================================
+    # VERIFICATION PERMISSIONS
+    # =====================================================
+
+    await verify.set_permissions(
+        everyone,
+
+        view_channel=False,
+        send_messages=False,
+        add_reactions=False,
+
+        create_public_threads=False,
+        create_private_threads=False,
+        send_messages_in_threads=False
+    )
+
+
+    # =====================================================
+    # GENERAL PERMISSIONS
+    # =====================================================
+
+    await general.set_permissions(
+        everyone,
+
         view_channel=False,
         send_messages=False
     )
 
-    await verify_channel.set_permissions(
-        everyone,
-        view_channel=False,
-        send_messages=False
-    )
 
-    await general_channel.set_permissions(
-        everyone,
-        view_channel=False,
-        send_messages=False
-    )
+    await general.set_permissions(
+        verified,
 
-    # Verified users can see and use general.
-    await general_channel.set_permissions(
-        verified_role,
         view_channel=True,
         send_messages=True,
+
+        attach_files=False,
+        embed_links=False,
+        add_reactions=False,
+
+        create_public_threads=False,
+        create_private_threads=False,
+        send_messages_in_threads=False,
+
         read_message_history=True
     )
 
+
+    # =====================================================
+    # MOD LOGS
+    # =====================================================
+
+    await logs.set_permissions(
+        everyone,
+        view_channel=False
+    )
+
+
+    await logs.set_permissions(
+        verified,
+        view_channel=False
+    )
+
+
+    # =====================================================
+    # RULES POST
+    # =====================================================
+
     rules_embed = discord.Embed(
         title="📜 SSP Modding Hub Rules",
-        description="Welcome to **SSP Modding Hub!**\n\nPlease follow the rules below.",
+
+        description=(
+            "Welcome to **SSP Modding Hub!**\n\n"
+
+            "• No spam.\n"
+            "• No repeated copy-paste messages.\n"
+            "• No GIFs or files in general.\n"
+            "• No Discord invites.\n"
+            "• No links in general.\n"
+            "• No harassment or slurs.\n"
+            "• Do not tell people to hurt themselves.\n"
+            "• Be respectful.\n"
+            "• Follow Discord's rules.\n\n"
+
+            "`general` has a **10-second cooldown**."
+        ),
+
         color=discord.Color.blue()
     )
 
-    rules_embed.add_field(
-        name="1️⃣ No Spam",
-        value="Do not spam messages, emojis, images, or links.",
-        inline=False
+
+    await rules.send(
+        embed=rules_embed
     )
 
-    rules_embed.add_field(
-        name="2️⃣ No Raiding",
-        value="Do not raid or help people raid the server.",
-        inline=False
-    )
 
-    rules_embed.add_field(
-        name="3️⃣ No Ping Spam",
-        value="Do not repeatedly ping members or roles.",
-        inline=False
-    )
+    # =====================================================
+    # VERIFICATION POST
+    # =====================================================
 
-    rules_embed.add_field(
-        name="4️⃣ Be Respectful",
-        value="Treat other members respectfully.",
-        inline=False
-    )
-
-    rules_embed.add_field(
-        name="5️⃣ Follow Discord Rules",
-        value="Follow Discord's Terms and Community Guidelines.",
-        inline=False
-    )
-
-    await rules_channel.send(embed=rules_embed)
-
-    verification_embed = discord.Embed(
+    verify_embed = discord.Embed(
         title="✅ Verification",
+
         description=(
-            "Welcome to **SSP Modding Hub!**\n\n"
-            "Press the **✅ Verify** button below.\n\n"
-            "After verification, you will unlock `💬・general`."
+            "Press **✅ Verify** below.\n\n"
+
+            "After verification you will unlock "
+            "`💬・general`.\n\n"
+
+            "You cannot send messages, reactions, "
+            "files, or anything else in this channel."
         ),
+
         color=discord.Color.green()
     )
 
-    await verify_channel.send(
-        embed=verification_embed,
+
+    await verify.send(
+        embed=verify_embed,
         view=VerifyView()
     )
 
+
     await interaction.followup.send(
-        "✅ **Verification system created!**\n\n"
+        "✅ **Setup complete!**\n\n"
+
         "Created:\n"
-        "👤 `Verified` role\n"
-        "📜 `rules`\n"
-        "✅ `verification`\n"
-        "💬 `general`\n\n"
-        "⏱️ `general` has a **10-second slowmode**.\n"
-        "🔒 Normal members cannot see the setup yet.\n\n"
-        "Run `/showsetup` when you're ready.",
+        "👤 Verified role\n"
+        "📜 Rules\n"
+        "✅ Verification\n"
+        "💬 General\n"
+        "🛡️ Private mod logs\n\n"
+
+        "Run `/showsetup` when ready.",
+
         ephemeral=True
     )
 
@@ -378,250 +1269,339 @@ async def setup(interaction: discord.Interaction):
 
 @tree.command(
     name="showsetup",
-    description="Open the SSP verification system"
+    description="Open verification"
 )
-@app_commands.checks.has_permissions(administrator=True)
-async def showsetup(interaction: discord.Interaction):
-    guild = interaction.guild
-
-    if guild is None:
-        await interaction.response.send_message(
-            "❌ Use this command inside your server.",
-            ephemeral=True
-        )
-        return
-
-    category = discord.utils.get(
-        guild.categories,
-        name=CATEGORY_NAME
-    )
-
-    if category is None:
-        await interaction.response.send_message(
-            "❌ Run `/setup` first.",
-            ephemeral=True
-        )
-        return
-
-    everyone = guild.default_role
-
-    rules_channel = discord.utils.get(
-        category.text_channels,
-        name=RULES_CHANNEL_NAME
-    )
-
-    verify_channel = discord.utils.get(
-        category.text_channels,
-        name=VERIFY_CHANNEL_NAME
-    )
-
-    general_channel = discord.utils.get(
-        category.text_channels,
-        name=GENERAL_CHANNEL_NAME
-    )
-
-    verified_role = discord.utils.get(
-        guild.roles,
-        name=VERIFIED_ROLE_NAME
-    )
-
-    await category.set_permissions(
-        everyone,
-        view_channel=True
-    )
-
-    if rules_channel:
-        await rules_channel.set_permissions(
-            everyone,
-            view_channel=True,
-            send_messages=False,
-            add_reactions=False
-        )
-
-    if verify_channel:
-        await verify_channel.set_permissions(
-            everyone,
-            view_channel=True,
-            send_messages=False
-        )
-
-    if general_channel:
-        await general_channel.set_permissions(
-            everyone,
-            view_channel=False,
-            send_messages=False
-        )
-
-        if verified_role:
-            await general_channel.set_permissions(
-                verified_role,
-                view_channel=True,
-                send_messages=True,
-                read_message_history=True
-            )
-
-        await general_channel.edit(slowmode_delay=10)
-
-    await interaction.response.send_message(
-        "✅ **Verification is open!**\n"
-        "Members can see the rules and verification channel.\n"
-        "They press **✅ Verify** to unlock `💬・general`.",
-        ephemeral=True
-    )
-
-
-# =========================================================
-# /HIDESETUP
-# =========================================================
-
-@tree.command(
-    name="hidesetup",
-    description="Hide the SSP verification system"
+@app_commands.checks.has_permissions(
+    administrator=True
 )
-@app_commands.checks.has_permissions(administrator=True)
-async def hidesetup(interaction: discord.Interaction):
-    guild = interaction.guild
-
-    if guild is None:
-        await interaction.response.send_message(
-            "❌ Use this command inside your server.",
-            ephemeral=True
-        )
-        return
-
-    category = discord.utils.get(
-        guild.categories,
-        name=CATEGORY_NAME
-    )
-
-    if category is None:
-        await interaction.response.send_message(
-            "❌ Verification setup not found.",
-            ephemeral=True
-        )
-        return
-
-    everyone = guild.default_role
-
-    await category.set_permissions(
-        everyone,
-        view_channel=False
-    )
-
-    for channel in category.channels:
-        await channel.set_permissions(
-            everyone,
-            view_channel=False
-        )
-
-    await interaction.response.send_message(
-        "🙈 Verification system is hidden.",
-        ephemeral=True
-    )
-
-
-# =========================================================
-# /UNVERIFY
-# =========================================================
-
-@tree.command(
-    name="unverify",
-    description="Remove verification from a member"
-)
-@app_commands.describe(
-    member="Member to remove verification from"
-)
-@app_commands.checks.has_permissions(administrator=True)
-async def unverify(
-    interaction: discord.Interaction,
-    member: discord.Member
+async def showsetup(
+    interaction
 ):
+
     guild = interaction.guild
 
-    if guild is None:
-        await interaction.response.send_message(
-            "❌ Use this command inside your server.",
-            ephemeral=True
-        )
-        return
 
-    verified_role = discord.utils.get(
-        guild.roles,
-        name=VERIFIED_ROLE_NAME
+    rules = discord.utils.get(
+        guild.text_channels,
+        name=RULES_CHANNEL
     )
 
-    if verified_role is None:
+
+    verify = discord.utils.get(
+        guild.text_channels,
+        name=VERIFY_CHANNEL
+    )
+
+
+    general = discord.utils.get(
+        guild.text_channels,
+        name=GENERAL_CHANNEL
+    )
+
+
+    verified = discord.utils.get(
+        guild.roles,
+        name=VERIFIED_ROLE
+    )
+
+
+    if not all([
+        rules,
+        verify,
+        general,
+        verified
+    ]):
+
         await interaction.response.send_message(
-            "❌ Verified role not found.",
+            "❌ Setup is missing. Run `/setup`.",
             ephemeral=True
         )
+
         return
 
-    if verified_role not in member.roles:
-        await interaction.response.send_message(
-            f"⚠️ {member.mention} is not verified.",
-            ephemeral=True
-        )
-        return
 
-    try:
-        await member.remove_roles(
-            verified_role,
-            reason=f"Removed by {interaction.user}"
-        )
+    everyone = guild.default_role
 
-        await interaction.response.send_message(
-            f"✅ Removed verification from {member.mention}.",
-            ephemeral=True
-        )
 
-    except discord.Forbidden:
-        await interaction.response.send_message(
-            "❌ I can't remove the role.\n"
-            "Move my bot role above `Verified` and make sure I have **Manage Roles**.",
-            ephemeral=True
-        )
+    # Rules = view only
+
+    await rules.set_permissions(
+        everyone,
+
+        view_channel=True,
+        send_messages=False,
+        add_reactions=False,
+
+        create_public_threads=False,
+        create_private_threads=False,
+        send_messages_in_threads=False
+    )
+
+
+    # Verification = view only
+
+    await verify.set_permissions(
+        everyone,
+
+        view_channel=True,
+        send_messages=False,
+        add_reactions=False,
+
+        create_public_threads=False,
+        create_private_threads=False,
+        send_messages_in_threads=False
+    )
+
+
+    # General hidden from unverified
+
+    await general.set_permissions(
+        everyone,
+
+        view_channel=False,
+        send_messages=False
+    )
+
+
+    # Verified = text only
+
+    await general.set_permissions(
+        verified,
+
+        view_channel=True,
+        send_messages=True,
+
+        attach_files=False,
+        embed_links=False,
+        add_reactions=False,
+
+        create_public_threads=False,
+        create_private_threads=False,
+        send_messages_in_threads=False,
+
+        read_message_history=True
+    )
+
+
+    await general.edit(
+        slowmode_delay=10
+    )
+
+
+    await interaction.response.send_message(
+        "✅ Verification is open.\n\n"
+        "Members can only view Rules + Verification.",
+        ephemeral=True
+    )
 
 
 # =========================================================
-# ERROR HANDLER
+# /LOCKDOWN
+# =========================================================
+
+@tree.command(
+    name="lockdown",
+    description="Lock general during a raid"
+)
+@app_commands.checks.has_permissions(
+    administrator=True
+)
+async def lockdown(
+    interaction
+):
+
+    guild = interaction.guild
+
+
+    general = discord.utils.get(
+        guild.text_channels,
+        name=GENERAL_CHANNEL
+    )
+
+
+    verified = discord.utils.get(
+        guild.roles,
+        name=VERIFIED_ROLE
+    )
+
+
+    if (
+        general is None
+        or verified is None
+    ):
+
+        await interaction.response.send_message(
+            "❌ Setup not found.",
+            ephemeral=True
+        )
+
+        return
+
+
+    raid_lockdowns.add(
+        guild.id
+    )
+
+
+    overwrite = general.overwrites_for(
+        verified
+    )
+
+
+    overwrite.send_messages = False
+
+
+    await general.set_permissions(
+        verified,
+        overwrite=overwrite
+    )
+
+
+    await interaction.response.send_message(
+        "🔒 General locked.",
+        ephemeral=True
+    )
+
+
+# =========================================================
+# /UNLOCK
+# =========================================================
+
+@tree.command(
+    name="unlock",
+    description="Unlock general after a raid"
+)
+@app_commands.checks.has_permissions(
+    administrator=True
+)
+async def unlock(
+    interaction
+):
+
+    guild = interaction.guild
+
+
+    general = discord.utils.get(
+        guild.text_channels,
+        name=GENERAL_CHANNEL
+    )
+
+
+    verified = discord.utils.get(
+        guild.roles,
+        name=VERIFIED_ROLE
+    )
+
+
+    if (
+        general is None
+        or verified is None
+    ):
+
+        await interaction.response.send_message(
+            "❌ Setup not found.",
+            ephemeral=True
+        )
+
+        return
+
+
+    raid_lockdowns.discard(
+        guild.id
+    )
+
+
+    await general.set_permissions(
+        verified,
+
+        view_channel=True,
+        send_messages=True,
+
+        attach_files=False,
+        embed_links=False,
+        add_reactions=False,
+
+        create_public_threads=False,
+        create_private_threads=False,
+        send_messages_in_threads=False,
+
+        read_message_history=True
+    )
+
+
+    await interaction.response.send_message(
+        "🔓 General unlocked.",
+        ephemeral=True
+    )
+
+
+# =========================================================
+# ERRORS
 # =========================================================
 
 @tree.error
-async def on_app_command_error(
-    interaction: discord.Interaction,
-    error: app_commands.AppCommandError
+async def command_error(
+    interaction,
+    error
 ):
+
     print("")
-    print("==========================================")
-    print("❌ COMMAND ERROR")
-    print("==========================================")
+    print("============================")
+    print("COMMAND ERROR")
+    print("============================")
     print(repr(error))
 
-    if hasattr(error, "original"):
-        print("ORIGINAL ERROR:")
-        print(repr(error.original))
 
-    print("==========================================")
+    if hasattr(
+        error,
+        "original"
+    ):
+
+        print(
+            "ORIGINAL:",
+            repr(error.original)
+        )
+
+
+    print("============================")
     print("")
 
-    if isinstance(error, app_commands.MissingPermissions):
-        message = "❌ You need Administrator permission to use this command."
+
+    if isinstance(
+        error,
+        app_commands.MissingPermissions
+    ):
+
+        text = (
+            "❌ You need Administrator permission."
+        )
+
     else:
-        message = "❌ Something went wrong. Check the bot logs for the exact error."
+
+        text = (
+            "❌ Something went wrong. "
+            "Check the Railway logs."
+        )
+
 
     try:
+
         if interaction.response.is_done():
+
             await interaction.followup.send(
-                message,
+                text,
                 ephemeral=True
             )
+
         else:
+
             await interaction.response.send_message(
-                message,
+                text,
                 ephemeral=True
             )
+
     except Exception:
+
         pass
 
 
@@ -630,10 +1610,15 @@ async def on_app_command_error(
 # =========================================================
 
 if __name__ == "__main__":
+
     if not TOKEN:
+
         raise RuntimeError(
             " is missing. "
-            "Add it as an environment variable in Railway."
+            "Add it in Railway Variables."
         )
 
-    client.run(TOKEN)
+
+    client.run(
+        TOKEN
+    )
