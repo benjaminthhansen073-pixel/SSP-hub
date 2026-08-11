@@ -1,54 +1,68 @@
 import os
 import re
+import json
 import asyncio
-from collections import defaultdict, deque
+from pathlib import Path
 from datetime import timedelta
+from collections import defaultdict, deque
 
 import discord
 from discord import app_commands
 
 
 # =========================================================
-# SETTINGS
+# TOKEN
 # =========================================================
 
 TOKEN = os.getenv("DISCORD_BOT_TOKEN")
 
-VERIFIED_ROLE = "Verified"
+
+# =========================================================
+# SERVER NAMES
+# =========================================================
+
+VERIFIED_ROLE_NAME = "Verified"
 
 CATEGORY_NAME = "✅ VERIFICATION"
 
-RULES_CHANNEL = "📜・rules"
-VERIFY_CHANNEL = "✅・verification"
-GENERAL_CHANNEL = "💬・general"
-MOD_LOG_CHANNEL = "🛡️・mod-logs"
-SHARED_MODS_CHANNEL = "🧩・shared-mods"
+RULES_CHANNEL_NAME = "📜・rules"
+VERIFY_CHANNEL_NAME = "✅・verification"
+WELCOME_CHANNEL_NAME = "👋・welcome"
+GENERAL_CHANNEL_NAME = "💬・general"
+
+MOD_LOG_CHANNEL_NAME = "🛡️・mod-logs"
+MOD_REVIEW_CHANNEL_NAME = "🔎・mod-review"
+
+SHARED_MODS_NAME = "🧩・shared-mods"
+SUGGESTIONS_NAME = "💡・suggestions"
 
 
 # =========================================================
 # COOLDOWNS
 # =========================================================
 
-GENERAL_SLOWMODE = 10
+GENERAL_SLOWMODE_SECONDS = 10
 
-# 10 minutes between new Shared Mods posts
-MOD_POST_COOLDOWN = 600
+SHARED_MOD_COMMENT_SLOWMODE = 10
 
-# 10 seconds between comments in Shared Mods
-MOD_COMMENT_SLOWMODE = 10
+SUGGESTION_POST_COOLDOWN = 300
+SUGGESTION_COMMENT_SLOWMODE = 10
+
+MOD_SUBMIT_COOLDOWN_SECONDS = 600
 
 
 # =========================================================
-# MODERATION
+# MODERATION SETTINGS
 # =========================================================
 
-# Bad language timeout
-BAD_WORD_TIMEOUT = 30
+BAD_WORD_TIMEOUT_MINUTES = 30
 
-# Fast spam protection
-SPAM_TIMEOUT = 10
+SPAM_TIMEOUT_MINUTES = 10
 SPAM_MESSAGE_LIMIT = 6
 SPAM_WINDOW_SECONDS = 8
+
+MASS_MENTION_LIMIT = 5
+MASS_MENTION_TIMEOUT_MINUTES = 30
 
 
 # =========================================================
@@ -56,9 +70,46 @@ SPAM_WINDOW_SECONDS = 8
 # =========================================================
 
 RAID_JOIN_LIMIT = 6
-RAID_JOIN_WINDOW = 10
+RAID_JOIN_WINDOW_SECONDS = 10
 
-NEW_ACCOUNT_HOURS = 24
+MIN_ACCOUNT_AGE_HOURS = 24
+
+
+# =========================================================
+# ALLOWED MOD FILE TYPES
+# =========================================================
+
+ALLOWED_MOD_EXTENSIONS = {
+    ".zip",
+    ".rar",
+    ".7z",
+    ".dll",
+    ".py",
+    ".js",
+    ".txt",
+}
+
+
+# =========================================================
+# FILE STORAGE
+# =========================================================
+#
+# If Railway has /data mounted as a Volume,
+# warnings + mod cooldowns can survive redeploys.
+#
+
+if Path("/data").exists():
+
+    DATA_FOLDER = Path("/data")
+
+else:
+
+    DATA_FOLDER = Path(".")
+
+
+WARNINGS_FILE = DATA_FOLDER / "warnings.json"
+
+MOD_COOLDOWNS_FILE = DATA_FOLDER / "mod_cooldowns.json"
 
 
 # =========================================================
@@ -91,18 +142,17 @@ tree = app_commands.CommandTree(
 # MEMORY
 # =========================================================
 
-# Used only for FAST spam.
-# Same-message-repeat detection has been removed.
-
 message_times = defaultdict(
     deque
 )
 
-recent_joins = deque()
+recent_joins = defaultdict(
+    deque
+)
 
 raid_lockdowns = set()
 
-view_registered = False
+views_registered = False
 
 
 # =========================================================
@@ -119,7 +169,6 @@ BAD_PHRASES = [
 ]
 
 
-# Detect common forms of a racial slur
 NWORD_PATTERN = re.compile(
     r"\bn[\W_]*[i1!][\W_]*g[\W_]*g[\W_]*"
     r"[e3a@][\W_]*r?s?\b",
@@ -127,7 +176,6 @@ NWORD_PATTERN = re.compile(
 )
 
 
-# Discord invites
 INVITE_PATTERN = re.compile(
     r"(?:https?://)?"
     r"(?:www\.)?"
@@ -137,7 +185,6 @@ INVITE_PATTERN = re.compile(
 )
 
 
-# GIF links
 GIF_PATTERN = re.compile(
     r"(?:https?://\S+\.gif(?:\?\S*)?$)|"
     r"(?:https?://)?"
@@ -148,7 +195,6 @@ GIF_PATTERN = re.compile(
 )
 
 
-# Any URL
 URL_PATTERN = re.compile(
     r"https?://\S+",
     re.IGNORECASE
@@ -156,25 +202,222 @@ URL_PATTERN = re.compile(
 
 
 # =========================================================
+# JSON HELPERS
+# =========================================================
+
+def load_json(path):
+
+    if not path.exists():
+        return {}
+
+    try:
+
+        with open(
+            path,
+            "r",
+            encoding="utf-8"
+        ) as file:
+
+            return json.load(file)
+
+    except Exception:
+
+        return {}
+
+
+def save_json(
+    path,
+    data
+):
+
+    try:
+
+        path.parent.mkdir(
+            parents=True,
+            exist_ok=True
+        )
+
+        with open(
+            path,
+            "w",
+            encoding="utf-8"
+        ) as file:
+
+            json.dump(
+                data,
+                file,
+                indent=2
+            )
+
+    except Exception as error:
+
+        print(
+            "JSON SAVE ERROR:",
+            repr(error)
+        )
+
+
+warnings_data = load_json(
+    WARNINGS_FILE
+)
+
+mod_cooldowns = load_json(
+    MOD_COOLDOWNS_FILE
+)
+
+
+# =========================================================
+# WARNING FUNCTIONS
+# =========================================================
+
+def warning_key(
+    guild_id,
+    user_id
+):
+
+    return f"{guild_id}:{user_id}"
+
+
+def get_user_warnings(
+    guild_id,
+    user_id
+):
+
+    key = warning_key(
+        guild_id,
+        user_id
+    )
+
+    return warnings_data.get(
+        key,
+        []
+    )
+
+
+def add_user_warning(
+    guild_id,
+    user_id,
+    moderator_id,
+    reason
+):
+
+    key = warning_key(
+        guild_id,
+        user_id
+    )
+
+    warnings_data.setdefault(
+        key,
+        []
+    )
+
+    warnings_data[key].append({
+        "moderator": moderator_id,
+        "reason": reason,
+        "time": discord.utils.utcnow().isoformat()
+    })
+
+    save_json(
+        WARNINGS_FILE,
+        warnings_data
+    )
+
+
+def clear_user_warnings(
+    guild_id,
+    user_id
+):
+
+    key = warning_key(
+        guild_id,
+        user_id
+    )
+
+    warnings_data.pop(
+        key,
+        None
+    )
+
+    save_json(
+        WARNINGS_FILE,
+        warnings_data
+    )
+
+
+# =========================================================
+# MOD COOLDOWN FUNCTIONS
+# =========================================================
+
+def mod_cooldown_key(
+    guild_id,
+    user_id
+):
+
+    return f"{guild_id}:{user_id}"
+
+
+def get_mod_cooldown(
+    guild_id,
+    user_id
+):
+
+    key = mod_cooldown_key(
+        guild_id,
+        user_id
+    )
+
+    value = mod_cooldowns.get(
+        key
+    )
+
+    if not value:
+        return None
+
+    try:
+
+        return discord.utils.parse_time(
+            value
+        )
+
+    except Exception:
+
+        return None
+
+
+def set_mod_cooldown(
+    guild_id,
+    user_id
+):
+
+    key = mod_cooldown_key(
+        guild_id,
+        user_id
+    )
+
+    mod_cooldowns[key] = (
+        discord.utils.utcnow().isoformat()
+    )
+
+    save_json(
+        MOD_COOLDOWNS_FILE,
+        mod_cooldowns
+    )
+
+
+# =========================================================
 # HELPERS
 # =========================================================
 
-def contains_bad_language(text):
+def is_staff(
+    member
+):
 
-    lower = text.lower()
+    if not isinstance(
+        member,
+        discord.Member
+    ):
 
-    if NWORD_PATTERN.search(text):
-        return True
-
-    for phrase in BAD_PHRASES:
-
-        if phrase in lower:
-            return True
-
-    return False
-
-
-def is_staff(member):
+        return False
 
     permissions = member.guild_permissions
 
@@ -186,7 +429,38 @@ def is_staff(member):
     )
 
 
-async def delete_message(message):
+def allowed_mod_file(
+    filename
+):
+
+    extension = Path(
+        filename.lower()
+    ).suffix
+
+    return extension in ALLOWED_MOD_EXTENSIONS
+
+
+def contains_bad_language(
+    text
+):
+
+    if NWORD_PATTERN.search(
+        text
+    ):
+
+        return True
+
+    lowered = text.lower()
+
+    return any(
+        phrase in lowered
+        for phrase in BAD_PHRASES
+    )
+
+
+async def safe_delete(
+    message
+):
 
     try:
 
@@ -200,7 +474,7 @@ async def delete_message(message):
         pass
 
 
-async def warning_message(
+async def temporary_warning(
     channel,
     member,
     text
@@ -208,29 +482,15 @@ async def warning_message(
 
     try:
 
-        msg = await channel.send(
+        warning = await channel.send(
             f"{member.mention} {text}"
         )
 
-        await asyncio.sleep(7)
-
-        await msg.delete()
-
-    except Exception:
-
-        pass
-
-
-async def send_dm(
-    member,
-    text
-):
-
-    try:
-
-        await member.send(
-            text
+        await asyncio.sleep(
+            7
         )
+
+        await warning.delete()
 
     except Exception:
 
@@ -265,12 +525,13 @@ async def timeout_member(
 async def mod_log(
     guild,
     title,
-    description
+    description,
+    color=discord.Color.orange()
 ):
 
     channel = discord.utils.get(
         guild.text_channels,
-        name=MOD_LOG_CHANNEL
+        name=MOD_LOG_CHANNEL_NAME
     )
 
     if channel is None:
@@ -279,7 +540,8 @@ async def mod_log(
     embed = discord.Embed(
         title=title,
         description=description,
-        color=discord.Color.orange()
+        color=color,
+        timestamp=discord.utils.utcnow()
     )
 
     try:
@@ -294,16 +556,16 @@ async def mod_log(
 
 
 # =========================================================
-# FAST SPAM CHECK
+# FAST SPAM
 # =========================================================
 
-async def check_spam(
+async def check_fast_spam(
     message,
     scope
 ):
 
-    member = message.author
     guild = message.guild
+    member = message.author
 
     key = (
         guild.id,
@@ -331,33 +593,29 @@ async def check_spam(
         times.popleft()
 
 
-    # =====================================================
-    # FAST SPAM
-    # =====================================================
-
     if len(times) >= SPAM_MESSAGE_LIMIT:
 
         times.clear()
 
-        await delete_message(
+        await safe_delete(
             message
         )
 
         success = await timeout_member(
             member,
-            SPAM_TIMEOUT,
-            "Message spam"
+            SPAM_TIMEOUT_MINUTES,
+            "Fast message spam"
         )
 
         if success:
 
-            await warning_message(
+            await temporary_warning(
                 message.channel,
                 member,
                 (
                     "⚠️ Spam detected. "
                     "You have been timed out for "
-                    "**10 minutes**."
+                    f"**{SPAM_TIMEOUT_MINUTES} minutes**."
                 )
             )
 
@@ -368,15 +626,12 @@ async def check_spam(
                 f"User: {member.mention}\n"
                 f"Reason: {SPAM_MESSAGE_LIMIT}+ messages "
                 f"in {SPAM_WINDOW_SECONDS} seconds\n"
-                f"Timeout: {SPAM_TIMEOUT} minutes"
+                f"Timeout: {SPAM_TIMEOUT_MINUTES} minutes"
             )
         )
 
         return True
 
-
-    # IMPORTANT:
-    # There is NO same-message-3-times timeout anymore.
 
     return False
 
@@ -389,7 +644,9 @@ class VerifyView(
     discord.ui.View
 ):
 
-    def __init__(self):
+    def __init__(
+        self
+    ):
 
         super().__init__(
             timeout=None
@@ -400,7 +657,7 @@ class VerifyView(
         label="Verify",
         emoji="✅",
         style=discord.ButtonStyle.green,
-        custom_id="ssp_verify_button_v5"
+        custom_id="ssp_verify_button_v10"
     )
     async def verify_button(
         self,
@@ -422,7 +679,6 @@ class VerifyView(
 
         member = interaction.user
 
-
         if not isinstance(
             member,
             discord.Member
@@ -433,7 +689,7 @@ class VerifyView(
 
         role = discord.utils.get(
             guild.roles,
-            name=VERIFIED_ROLE
+            name=VERIFIED_ROLE_NAME
         )
 
 
@@ -458,44 +714,69 @@ class VerifyView(
 
 
         # =================================================
-        # RAID PROTECTION
+        # ACCOUNT AGE CHECK
+        # =================================================
+
+        account_age = (
+            discord.utils.utcnow()
+            - member.created_at
+        )
+
+
+        if account_age < timedelta(
+            hours=MIN_ACCOUNT_AGE_HOURS
+        ):
+
+            await interaction.response.send_message(
+                (
+                    "🛡️ Your Discord account is too new "
+                    "to verify automatically.\n\n"
+                    f"Accounts must be at least "
+                    f"**{MIN_ACCOUNT_AGE_HOURS} hours old**."
+                ),
+                ephemeral=True
+            )
+
+            await mod_log(
+                guild,
+                "🛡️ New account blocked",
+                (
+                    f"User: {member.mention}\n"
+                    f"Account age: {account_age}"
+                )
+            )
+
+            return
+
+
+        # =================================================
+        # RAID LOCKDOWN
         # =================================================
 
         if guild.id in raid_lockdowns:
 
-            age = (
-                discord.utils.utcnow()
-                - member.created_at
+            await interaction.response.send_message(
+                (
+                    "🚨 Verification is temporarily locked "
+                    "because raid protection is active."
+                ),
+                ephemeral=True
             )
 
-            if age < timedelta(
-                hours=NEW_ACCOUNT_HOURS
-            ):
-
-                await interaction.response.send_message(
-                    (
-                        "🛡️ The server is currently under "
-                        "raid protection.\n\n"
-                        "Very new accounts cannot verify right now."
-                    ),
-                    ephemeral=True
-                )
-
-                return
+            return
 
 
         bot_member = guild.me
 
 
-        if bot_member is None:
-            return
-
-
-        if role >= bot_member.top_role:
+        if (
+            bot_member is None
+            or role >= bot_member.top_role
+        ):
 
             await interaction.response.send_message(
                 (
-                    "❌ My bot role needs to be ABOVE "
+                    "❌ My bot role must be above "
                     "the Verified role."
                 ),
                 ephemeral=True
@@ -512,12 +793,64 @@ class VerifyView(
             )
 
 
+            # =============================================
+            # WELCOME CHANNEL
+            # =============================================
+
+            welcome_channel = discord.utils.get(
+                guild.text_channels,
+                name=WELCOME_CHANNEL_NAME
+            )
+
+
+            if welcome_channel:
+
+                embed = discord.Embed(
+                    title="👋 Welcome!",
+                    description=(
+                        f"Welcome {member.mention} to "
+                        f"**{guild.name}**!\n\n"
+                        "You are now verified and have access "
+                        "to General, Shared Mods, and Suggestions."
+                    ),
+                    color=discord.Color.green()
+                )
+
+                try:
+
+                    await welcome_channel.send(
+                        embed=embed
+                    )
+
+                except Exception:
+
+                    pass
+
+
+            # =============================================
+            # VERIFICATION LOG
+            # =============================================
+
+            await mod_log(
+                guild,
+                "✅ Member Verified",
+                (
+                    f"User: {member.mention}\n"
+                    f"User ID: `{member.id}`\n"
+                    f"Account created: "
+                    f"<t:{int(member.created_at.timestamp())}:R>"
+                ),
+                discord.Color.green()
+            )
+
+
             await interaction.response.send_message(
                 (
-                    "✅ **Verified!**\n\n"
-                    "You can now access:\n"
-                    "💬・general\n"
-                    "🧩・shared-mods"
+                    "✅ **You are verified!**\n\n"
+                    "You now have access to:\n"
+                    "💬 General\n"
+                    "🧩 Shared Mods\n"
+                    "💡 Suggestions"
                 ),
                 ephemeral=True
             )
@@ -526,7 +859,10 @@ class VerifyView(
         except discord.Forbidden:
 
             await interaction.response.send_message(
-                "❌ I need Manage Roles permission.",
+                (
+                    "❌ I couldn't give you the Verified role.\n"
+                    "Make sure I have **Manage Roles**."
+                ),
                 ephemeral=True
             )
 
@@ -538,16 +874,16 @@ class VerifyView(
 @client.event
 async def on_ready():
 
-    global view_registered
+    global views_registered
 
 
-    if not view_registered:
+    if not views_registered:
 
         client.add_view(
             VerifyView()
         )
 
-        view_registered = True
+        views_registered = True
 
 
     print("")
@@ -614,39 +950,39 @@ async def on_message(
     member = message.author
 
 
-    # Staff bypass moderation
-    if is_staff(member):
+    if is_staff(
+        member
+    ):
+
         return
 
 
     rules = discord.utils.get(
         guild.text_channels,
-        name=RULES_CHANNEL
+        name=RULES_CHANNEL_NAME
     )
 
-
-    verification = discord.utils.get(
+    verify = discord.utils.get(
         guild.text_channels,
-        name=VERIFY_CHANNEL
+        name=VERIFY_CHANNEL_NAME
     )
-
 
     general = discord.utils.get(
         guild.text_channels,
-        name=GENERAL_CHANNEL
+        name=GENERAL_CHANNEL_NAME
     )
 
 
     # =====================================================
-    # RULES / VERIFICATION = READ ONLY
+    # RULES + VERIFY = READ ONLY
     # =====================================================
 
     if message.channel in (
         rules,
-        verification
+        verify
     ):
 
-        await delete_message(
+        await safe_delete(
             message
         )
 
@@ -654,7 +990,7 @@ async def on_message(
 
 
     # =====================================================
-    # SHARED MODS FORUM
+    # FORUM THREAD MODERATION
     # =====================================================
 
     if isinstance(
@@ -665,213 +1001,102 @@ async def on_message(
         parent = message.channel.parent
 
 
-        if (
-            isinstance(
-                parent,
-                discord.ForumChannel
-            )
-            and parent.name == SHARED_MODS_CHANNEL
+        if isinstance(
+            parent,
+            discord.ForumChannel
         ):
 
-            text = message.content or ""
-
-
-            # =============================================
-            # BAD LANGUAGE
-            # =============================================
-
-            if contains_bad_language(
-                text
+            if parent.name in (
+                SHARED_MODS_NAME,
+                SUGGESTIONS_NAME
             ):
 
-                await delete_message(
-                    message
-                )
+                # =========================================
+                # BAD LANGUAGE
+                # =========================================
 
-                success = await timeout_member(
-                    member,
-                    BAD_WORD_TIMEOUT,
-                    "Prohibited language in Shared Mods"
-                )
+                if contains_bad_language(
+                    message.content or ""
+                ):
 
-                if success:
-
-                    await warning_message(
-                        message.channel,
-                        member,
-                        (
-                            "🚫 Prohibited language is not allowed. "
-                            "You have been timed out for **30 minutes**."
-                        )
-                    )
-
-
-                await mod_log(
-                    guild,
-                    "🚫 Shared Mods timeout",
-                    (
-                        f"User: {member.mention}\n"
-                        "Reason: prohibited language\n"
-                        "Timeout: 30 minutes"
-                    )
-                )
-
-                return
-
-
-            # =============================================
-            # DISCORD INVITES
-            # =============================================
-
-            if INVITE_PATTERN.search(
-                text
-            ):
-
-                await delete_message(
-                    message
-                )
-
-                await warning_message(
-                    message.channel,
-                    member,
-                    "⚠️ Discord invites are not allowed here."
-                )
-
-                return
-
-
-            # =============================================
-            # EXTERNAL LINKS
-            # =============================================
-
-            if URL_PATTERN.search(
-                text
-            ):
-
-                await delete_message(
-                    message
-                )
-
-                await warning_message(
-                    message.channel,
-                    member,
-                    (
-                        "⚠️ Upload the mod directly as a file. "
-                        "External links are not allowed."
-                    )
-                )
-
-                return
-
-
-            # =============================================
-            # STARTER POST
-            # =============================================
-
-            starter_message = (
-                message.id
-                == message.channel.id
-            )
-
-
-            if starter_message:
-
-                # Every new mod post must have exactly 1 file
-
-                if len(
-                    message.attachments
-                ) != 1:
-
-                    await send_dm(
-                        member,
-                        (
-                            "❌ Your Shared Mods post was removed.\n\n"
-                            "Every mod post must contain "
-                            "**exactly one file**.\n\n"
-                            "Create the post again with a title "
-                            "and one attached mod file."
-                        )
-                    )
-
-
-                    await mod_log(
-                        guild,
-                        "🗑️ Invalid mod post removed",
-                        (
-                            f"User: {member.mention}\n"
-                            f"Post: {message.channel.name}\n"
-                            "Reason: did not contain exactly one file"
-                        )
-                    )
-
-
-                    try:
-
-                        await message.channel.delete(
-                            reason=(
-                                "Shared Mods posts require "
-                                "exactly one file"
-                            )
-                        )
-
-                    except discord.Forbidden:
-
-                        pass
-
-
-                    return
-
-
-            # =============================================
-            # REPLIES = TEXT ONLY
-            # =============================================
-
-            else:
-
-                if message.attachments:
-
-                    await delete_message(
+                    await safe_delete(
                         message
                     )
 
-                    await warning_message(
-                        message.channel,
+                    await timeout_member(
                         member,
+                        BAD_WORD_TIMEOUT_MINUTES,
+                        "Prohibited language"
+                    )
+
+                    await mod_log(
+                        guild,
+                        "🚫 Forum timeout",
                         (
-                            "⚠️ Only the original mod post "
-                            "may contain a file. "
-                            "Replies are text-only."
+                            f"User: {member.mention}\n"
+                            f"Forum: {parent.name}\n"
+                            f"Timeout: "
+                            f"{BAD_WORD_TIMEOUT_MINUTES} minutes"
                         )
                     )
 
                     return
 
 
-            # =============================================
-            # FAST SPAM ONLY
-            # =============================================
+                # =========================================
+                # MASS PINGS
+                # =========================================
 
-            spammed = await check_spam(
-                message,
-                "shared_mods"
-            )
+                mention_count = (
+                    len(message.mentions)
+                    + len(message.role_mentions)
+                )
 
-            if spammed:
+
+                if (
+                    message.mention_everyone
+                    or mention_count >= MASS_MENTION_LIMIT
+                ):
+
+                    await safe_delete(
+                        message
+                    )
+
+                    await timeout_member(
+                        member,
+                        MASS_MENTION_TIMEOUT_MINUTES,
+                        "Mass mention spam"
+                    )
+
+                    await mod_log(
+                        guild,
+                        "🚨 Mass ping timeout",
+                        (
+                            f"User: {member.mention}\n"
+                            f"Forum: {parent.name}"
+                        )
+                    )
+
+                    return
+
+
+                await check_fast_spam(
+                    message,
+                    f"forum_{parent.id}"
+                )
+
                 return
-
-
-            return
 
 
     # =====================================================
     # GENERAL
     # =====================================================
 
-    if general is None:
-        return
+    if (
+        general is None
+        or message.channel.id != general.id
+    ):
 
-
-    if message.channel.id != general.id:
         return
 
 
@@ -879,16 +1104,16 @@ async def on_message(
 
 
     # =====================================================
-    # TEXT ONLY
+    # FILES / IMAGES
     # =====================================================
 
     if message.attachments:
 
-        await delete_message(
+        await safe_delete(
             message
         )
 
-        await warning_message(
+        await temporary_warning(
             message.channel,
             member,
             (
@@ -906,11 +1131,11 @@ async def on_message(
 
     if message.stickers:
 
-        await delete_message(
+        await safe_delete(
             message
         )
 
-        await warning_message(
+        await temporary_warning(
             message.channel,
             member,
             "⚠️ Stickers are not allowed."
@@ -927,11 +1152,11 @@ async def on_message(
         text
     ):
 
-        await delete_message(
+        await safe_delete(
             message
         )
 
-        await warning_message(
+        await temporary_warning(
             message.channel,
             member,
             "⚠️ GIFs are not allowed."
@@ -948,11 +1173,11 @@ async def on_message(
         text
     ):
 
-        await delete_message(
+        await safe_delete(
             message
         )
 
-        await warning_message(
+        await temporary_warning(
             message.channel,
             member,
             "⚠️ Discord invites are not allowed."
@@ -962,21 +1187,73 @@ async def on_message(
 
 
     # =====================================================
-    # LINKS
+    # OTHER LINKS
     # =====================================================
 
     if URL_PATTERN.search(
         text
     ):
 
-        await delete_message(
+        await safe_delete(
             message
         )
 
-        await warning_message(
+        await temporary_warning(
             message.channel,
             member,
-            "⚠️ Links are not allowed in general."
+            "⚠️ Links are not allowed in General."
+        )
+
+        return
+
+
+    # =====================================================
+    # MASS MENTION
+    # =====================================================
+
+    mention_count = (
+        len(message.mentions)
+        + len(message.role_mentions)
+    )
+
+
+    if (
+        message.mention_everyone
+        or mention_count >= MASS_MENTION_LIMIT
+    ):
+
+        await safe_delete(
+            message
+        )
+
+        success = await timeout_member(
+            member,
+            MASS_MENTION_TIMEOUT_MINUTES,
+            "Mass mention spam"
+        )
+
+        if success:
+
+            await temporary_warning(
+                message.channel,
+                member,
+                (
+                    "🚫 Mass ping detected. "
+                    "You have been timed out for "
+                    f"**{MASS_MENTION_TIMEOUT_MINUTES} minutes**."
+                )
+            )
+
+
+        await mod_log(
+            guild,
+            "🚨 Mass mention timeout",
+            (
+                f"User: {member.mention}\n"
+                f"Mentions: {mention_count}\n"
+                f"Timeout: "
+                f"{MASS_MENTION_TIMEOUT_MINUTES} minutes"
+            )
         )
 
         return
@@ -990,37 +1267,35 @@ async def on_message(
         text
     ):
 
-        await delete_message(
+        await safe_delete(
             message
         )
 
-
         success = await timeout_member(
             member,
-            BAD_WORD_TIMEOUT,
+            BAD_WORD_TIMEOUT_MINUTES,
             "Prohibited language / harassment"
         )
 
-
         if success:
 
-            await warning_message(
+            await temporary_warning(
                 message.channel,
                 member,
                 (
-                    "🚫 Prohibited language is not allowed. "
-                    "You have been timed out for **30 minutes**."
+                    "🚫 That language is not allowed. "
+                    "You have been timed out for "
+                    f"**{BAD_WORD_TIMEOUT_MINUTES} minutes**."
                 )
             )
 
 
         await mod_log(
             guild,
-            "🚫 30-minute timeout",
+            "🚫 Language timeout",
             (
                 f"User: {member.mention}\n"
-                "Reason: prohibited language / harassment\n"
-                "Timeout: 30 minutes"
+                f"Timeout: {BAD_WORD_TIMEOUT_MINUTES} minutes"
             )
         )
 
@@ -1028,16 +1303,13 @@ async def on_message(
 
 
     # =====================================================
-    # FAST SPAM ONLY
+    # FAST SPAM
     # =====================================================
 
-    spammed = await check_spam(
+    await check_fast_spam(
         message,
         "general"
     )
-
-    if spammed:
-        return
 
 
 # =========================================================
@@ -1049,35 +1321,32 @@ async def on_member_join(
     member
 ):
 
+    guild = member.guild
+
     now = discord.utils.utcnow()
 
+    joins = recent_joins[
+        guild.id
+    ]
 
-    recent_joins.append(
+    joins.append(
         now
     )
 
-
     cutoff = now - timedelta(
-        seconds=RAID_JOIN_WINDOW
+        seconds=RAID_JOIN_WINDOW_SECONDS
     )
 
-
     while (
-        recent_joins
-        and recent_joins[0] < cutoff
+        joins
+        and joins[0] < cutoff
     ):
 
-        recent_joins.popleft()
+        joins.popleft()
 
 
-    if len(
-        recent_joins
-    ) < RAID_JOIN_LIMIT:
-
+    if len(joins) < RAID_JOIN_LIMIT:
         return
-
-
-    guild = member.guild
 
 
     if guild.id in raid_lockdowns:
@@ -1089,35 +1358,34 @@ async def on_member_join(
     )
 
 
-    general = discord.utils.get(
-        guild.text_channels,
-        name=GENERAL_CHANNEL
+    verified_role = discord.utils.get(
+        guild.roles,
+        name=VERIFIED_ROLE_NAME
     )
 
 
-    verified = discord.utils.get(
-        guild.roles,
-        name=VERIFIED_ROLE
+    general = discord.utils.get(
+        guild.text_channels,
+        name=GENERAL_CHANNEL_NAME
     )
 
 
     if (
-        general is not None
-        and verified is not None
+        verified_role
+        and general
     ):
 
         try:
 
             overwrite = general.overwrites_for(
-                verified
+                verified_role
             )
 
-            overwrite.view_channel = True
             overwrite.send_messages = False
 
 
             await general.set_permissions(
-                verified,
+                verified_role,
                 overwrite=overwrite,
                 reason="Automatic raid lockdown"
             )
@@ -1129,13 +1397,14 @@ async def on_member_join(
 
     await mod_log(
         guild,
-        "🚨 RAID DETECTED",
+        "🚨 RAID LOCKDOWN ACTIVATED",
         (
-            f"{RAID_JOIN_LIMIT}+ accounts joined within "
-            f"{RAID_JOIN_WINDOW} seconds.\n\n"
-            "`general` has automatically been locked.\n\n"
-            "Use `/unlock` when it is safe."
-        )
+            f"{RAID_JOIN_LIMIT}+ accounts joined "
+            f"in {RAID_JOIN_WINDOW_SECONDS} seconds.\n\n"
+            "Verification is disabled and General is locked.\n"
+            "Use `/unlock` after checking the server."
+        ),
+        discord.Color.red()
     )
 
 
@@ -1145,7 +1414,7 @@ async def on_member_join(
 
 @tree.command(
     name="ping",
-    description="Check if the SSP bot is online"
+    description="Check if the bot is online"
 )
 async def ping(
     interaction
@@ -1154,7 +1423,6 @@ async def ping(
     latency = round(
         client.latency * 1000
     )
-
 
     await interaction.response.send_message(
         f"🏓 Pong! `{latency}ms`",
@@ -1168,7 +1436,7 @@ async def ping(
 
 @tree.command(
     name="setup",
-    description="Create SSP verification, moderation and Shared Mods"
+    description="Create or update the SSP server system"
 )
 @app_commands.checks.has_permissions(
     administrator=True
@@ -1179,11 +1447,10 @@ async def setup(
 
     guild = interaction.guild
 
-
     if guild is None:
 
         await interaction.response.send_message(
-            "❌ Use this inside your server.",
+            "❌ Use this command inside your server.",
             ephemeral=True
         )
 
@@ -1195,94 +1462,9 @@ async def setup(
     )
 
 
-    # =====================================================
-    # CHECK EXISTING SETUP
-    # =====================================================
-
-    existing = discord.utils.get(
-        guild.categories,
-        name=CATEGORY_NAME
-    )
-
-
-    if existing:
-
-        await interaction.followup.send(
-            (
-                "⚠️ The setup already exists.\n\n"
-                "Delete the old `✅ VERIFICATION` category "
-                "before running `/setup` again."
-            ),
-            ephemeral=True
-        )
-
-        return
-
+    everyone = guild.default_role
 
     bot_member = guild.me
-
-
-    if bot_member is None:
-
-        await interaction.followup.send(
-            "❌ I could not check my permissions.",
-            ephemeral=True
-        )
-
-        return
-
-
-    # =====================================================
-    # BOT PERMISSIONS
-    # =====================================================
-
-    permissions = bot_member.guild_permissions
-
-    missing = []
-
-
-    if not permissions.manage_channels:
-
-        missing.append(
-            "Manage Channels"
-        )
-
-
-    if not permissions.manage_roles:
-
-        missing.append(
-            "Manage Roles"
-        )
-
-
-    if not permissions.manage_messages:
-
-        missing.append(
-            "Manage Messages"
-        )
-
-
-    if not permissions.moderate_members:
-
-        missing.append(
-            "Moderate Members"
-        )
-
-
-    if missing:
-
-        await interaction.followup.send(
-            (
-                "❌ I am missing these permissions:\n\n"
-                + "\n".join(
-                    f"• {permission}"
-                    for permission in missing
-                )
-            ),
-            ephemeral=True
-        )
-
-        return
 
 
     # =====================================================
@@ -1291,102 +1473,202 @@ async def setup(
 
     verified = discord.utils.get(
         guild.roles,
-        name=VERIFIED_ROLE
+        name=VERIFIED_ROLE_NAME
     )
 
 
     if verified is None:
 
         verified = await guild.create_role(
-            name=VERIFIED_ROLE,
+            name=VERIFIED_ROLE_NAME,
             reason="SSP verification"
         )
-
-
-    everyone = guild.default_role
 
 
     # =====================================================
     # CATEGORY
     # =====================================================
 
-    category = await guild.create_category(
-        CATEGORY_NAME,
-        reason="SSP setup"
+    category = discord.utils.get(
+        guild.categories,
+        name=CATEGORY_NAME
     )
+
+
+    if category is None:
+
+        category = await guild.create_category(
+            CATEGORY_NAME,
+            reason="SSP setup"
+        )
 
 
     # =====================================================
-    # CHANNELS
+    # RULES
     # =====================================================
 
-    rules = await guild.create_text_channel(
-        RULES_CHANNEL,
-        category=category
+    rules = discord.utils.get(
+        guild.text_channels,
+        name=RULES_CHANNEL_NAME
     )
 
 
-    verify = await guild.create_text_channel(
-        VERIFY_CHANNEL,
-        category=category
+    if rules is None:
+
+        rules = await guild.create_text_channel(
+            RULES_CHANNEL_NAME,
+            category=category
+        )
+
+
+    # =====================================================
+    # VERIFY
+    # =====================================================
+
+    verify = discord.utils.get(
+        guild.text_channels,
+        name=VERIFY_CHANNEL_NAME
     )
 
 
-    general = await guild.create_text_channel(
-        GENERAL_CHANNEL,
-        category=category,
-        slowmode_delay=GENERAL_SLOWMODE
+    if verify is None:
+
+        verify = await guild.create_text_channel(
+            VERIFY_CHANNEL_NAME,
+            category=category
+        )
+
+
+    # =====================================================
+    # WELCOME
+    # =====================================================
+
+    welcome = discord.utils.get(
+        guild.text_channels,
+        name=WELCOME_CHANNEL_NAME
     )
 
 
-    logs = await guild.create_text_channel(
-        MOD_LOG_CHANNEL,
-        category=category
+    if welcome is None:
+
+        welcome = await guild.create_text_channel(
+            WELCOME_CHANNEL_NAME,
+            category=category
+        )
+
+
+    # =====================================================
+    # GENERAL
+    # =====================================================
+
+    general = discord.utils.get(
+        guild.text_channels,
+        name=GENERAL_CHANNEL_NAME
     )
+
+
+    if general is None:
+
+        general = await guild.create_text_channel(
+            GENERAL_CHANNEL_NAME,
+            category=category,
+            slowmode_delay=GENERAL_SLOWMODE_SECONDS
+        )
+
+
+    # =====================================================
+    # MOD LOGS
+    # =====================================================
+
+    mod_logs = discord.utils.get(
+        guild.text_channels,
+        name=MOD_LOG_CHANNEL_NAME
+    )
+
+
+    if mod_logs is None:
+
+        mod_logs = await guild.create_text_channel(
+            MOD_LOG_CHANNEL_NAME,
+            category=category
+        )
+
+
+    # =====================================================
+    # MOD REVIEW
+    # =====================================================
+
+    mod_review = discord.utils.get(
+        guild.text_channels,
+        name=MOD_REVIEW_CHANNEL_NAME
+    )
+
+
+    if mod_review is None:
+
+        mod_review = await guild.create_text_channel(
+            MOD_REVIEW_CHANNEL_NAME,
+            category=category
+        )
 
 
     # =====================================================
     # SHARED MODS FORUM
     # =====================================================
 
-    forum_overwrites = {
-
-        everyone: discord.PermissionOverwrite(
-            view_channel=False,
-            send_messages=False,
-            create_public_threads=False
-        ),
-
-        verified: discord.PermissionOverwrite(
-            view_channel=True,
-            send_messages=True,
-            create_public_threads=True,
-            send_messages_in_threads=True,
-            attach_files=True,
-            embed_links=False,
-            read_message_history=True
-        )
-    }
-
-
-    shared_mods = await guild.create_forum(
-        name=SHARED_MODS_CHANNEL,
-
-        category=category,
-
-        topic=(
-            "⚠️ WARNING: Do not automatically trust every mod "
-            "shared here. Files are uploaded by community members."
-        ),
-
-        slowmode_delay=MOD_POST_COOLDOWN,
-
-        default_thread_slowmode_delay=MOD_COMMENT_SLOWMODE,
-
-        overwrites=forum_overwrites,
-
-        reason="SSP Shared Mods forum"
+    shared_mods = discord.utils.get(
+        guild.forums,
+        name=SHARED_MODS_NAME
     )
+
+
+    if shared_mods is None:
+
+        shared_mods = await guild.create_forum(
+            name=SHARED_MODS_NAME,
+
+            category=category,
+
+            topic=(
+                "⚠️ Community-uploaded mods. "
+                "Do not automatically trust every file."
+            ),
+
+            default_thread_slowmode_delay=(
+                SHARED_MOD_COMMENT_SLOWMODE
+            )
+        )
+
+
+    # =====================================================
+    # SUGGESTIONS FORUM
+    # =====================================================
+
+    suggestions = discord.utils.get(
+        guild.forums,
+        name=SUGGESTIONS_NAME
+    )
+
+
+    if suggestions is None:
+
+        suggestions = await guild.create_forum(
+            name=SUGGESTIONS_NAME,
+
+            category=category,
+
+            topic=(
+                "💡 Suggest ideas for SSP Modding Hub."
+            ),
+
+            slowmode_delay=(
+                SUGGESTION_POST_COOLDOWN
+            ),
+
+            default_thread_slowmode_delay=(
+                SUGGESTION_COMMENT_SLOWMODE
+            )
+        )
 
 
     # =====================================================
@@ -1396,295 +1678,6 @@ async def setup(
     await rules.set_permissions(
         everyone,
 
-        view_channel=False,
-        send_messages=False,
-        add_reactions=False,
-
-        create_public_threads=False,
-        create_private_threads=False,
-        send_messages_in_threads=False
-    )
-
-
-    # =====================================================
-    # VERIFICATION PERMISSIONS
-    # =====================================================
-
-    await verify.set_permissions(
-        everyone,
-
-        view_channel=False,
-        send_messages=False,
-        add_reactions=False,
-
-        create_public_threads=False,
-        create_private_threads=False,
-        send_messages_in_threads=False
-    )
-
-
-    # =====================================================
-    # GENERAL PERMISSIONS
-    # =====================================================
-
-    await general.set_permissions(
-        everyone,
-
-        view_channel=False,
-        send_messages=False
-    )
-
-
-    await general.set_permissions(
-        verified,
-
-        view_channel=True,
-        send_messages=True,
-
-        attach_files=False,
-        embed_links=False,
-        add_reactions=False,
-
-        create_public_threads=False,
-        create_private_threads=False,
-        send_messages_in_threads=False,
-
-        read_message_history=True
-    )
-
-
-    # =====================================================
-    # MOD LOG PERMISSIONS
-    # =====================================================
-
-    await logs.set_permissions(
-        everyone,
-        view_channel=False
-    )
-
-
-    await logs.set_permissions(
-        verified,
-        view_channel=False
-    )
-
-
-    # =====================================================
-    # RULES MESSAGE
-    # =====================================================
-
-    rules_embed = discord.Embed(
-        title="📜 SSP Modding Hub Rules",
-
-        description=(
-            "Welcome to **SSP Modding Hub!**\n\n"
-
-            "• No fast spam.\n"
-            "• No GIFs, files, or images in general.\n"
-            "• No Discord invites in general.\n"
-            "• No links in general.\n"
-            "• No harassment or slurs.\n"
-            "• Do not tell people to hurt themselves.\n"
-            "• Be respectful.\n"
-            "• Follow Discord's rules.\n\n"
-
-            "💬 `general` has a **10-second cooldown**.\n\n"
-
-            "🧩 **Shared Mods:**\n"
-            "• Verified members only.\n"
-            "• One new mod post every **10 minutes**.\n"
-            "• Every mod post must have **exactly one file**.\n"
-            "• Replies are text-only.\n"
-            "• Comments have a **10-second cooldown**.\n"
-            "• Do not automatically trust files shared by members."
-        ),
-
-        color=discord.Color.blue()
-    )
-
-
-    await rules.send(
-        embed=rules_embed
-    )
-
-
-    # =====================================================
-    # VERIFY MESSAGE
-    # =====================================================
-
-    verify_embed = discord.Embed(
-        title="✅ Verification",
-
-        description=(
-            "Press **✅ Verify** below.\n\n"
-
-            "After verification you will unlock:\n"
-            "💬・general\n"
-            "🧩・shared-mods\n\n"
-
-            "You cannot send messages, reactions, files, "
-            "or anything else in this verification channel."
-        ),
-
-        color=discord.Color.green()
-    )
-
-
-    await verify.send(
-        embed=verify_embed,
-        view=VerifyView()
-    )
-
-
-    # =====================================================
-    # SHARED MODS WARNING POST
-    # =====================================================
-
-    try:
-
-        await shared_mods.create_thread(
-            name="⚠️ READ BEFORE DOWNLOADING MODS",
-
-            content=(
-                "⚠️ **DON'T TRUST EVERY MOD SHARED HERE**\n\n"
-
-                "Mods in this forum are uploaded by community members. "
-                "SSP Modding Hub does not guarantee that every uploaded "
-                "file is safe.\n\n"
-
-                "Only download and run files you trust.\n\n"
-
-                "**Posting rules:**\n"
-                "• One mod post every 10 minutes\n"
-                "• Exactly one file per new mod post\n"
-                "• Give your post a clear name/title\n"
-                "• Replies are text-only\n"
-                "• No fast spam\n"
-                "• No Discord invites\n"
-                "• No external download links"
-            )
-        )
-
-    except Exception as error:
-
-        print(
-            "WARNING POST ERROR:",
-            repr(error)
-        )
-
-
-    # =====================================================
-    # DONE
-    # =====================================================
-
-    await interaction.followup.send(
-        (
-            "✅ **Setup complete!**\n\n"
-
-            "Created:\n"
-            "👤 `Verified` role\n"
-            "📜 `rules`\n"
-            "✅ `verification`\n"
-            "💬 `general`\n"
-            "🧩 `shared-mods`\n"
-            "🛡️ `mod-logs`\n\n"
-
-            "There is NO same-message-3-times timeout anymore.\n\n"
-
-            "Run `/showsetup` when ready."
-        ),
-
-        ephemeral=True
-    )
-
-
-# =========================================================
-# /SHOWSETUP
-# =========================================================
-
-@tree.command(
-    name="showsetup",
-    description="Open SSP verification"
-)
-@app_commands.checks.has_permissions(
-    administrator=True
-)
-async def showsetup(
-    interaction
-):
-
-    guild = interaction.guild
-
-
-    if guild is None:
-
-        await interaction.response.send_message(
-            "❌ Use this inside your server.",
-            ephemeral=True
-        )
-
-        return
-
-
-    rules = discord.utils.get(
-        guild.text_channels,
-        name=RULES_CHANNEL
-    )
-
-
-    verify = discord.utils.get(
-        guild.text_channels,
-        name=VERIFY_CHANNEL
-    )
-
-
-    general = discord.utils.get(
-        guild.text_channels,
-        name=GENERAL_CHANNEL
-    )
-
-
-    shared_mods = discord.utils.get(
-        guild.forums,
-        name=SHARED_MODS_CHANNEL
-    )
-
-
-    verified = discord.utils.get(
-        guild.roles,
-        name=VERIFIED_ROLE
-    )
-
-
-    if not all([
-        rules,
-        verify,
-        general,
-        shared_mods,
-        verified
-    ]):
-
-        await interaction.response.send_message(
-            (
-                "❌ Setup is incomplete.\n"
-                "Delete the old setup and run `/setup`."
-            ),
-            ephemeral=True
-        )
-
-        return
-
-
-    everyone = guild.default_role
-
-
-    # =====================================================
-    # RULES = VIEW ONLY
-    # =====================================================
-
-    await rules.set_permissions(
-        everyone,
-
         view_channel=True,
         send_messages=False,
         add_reactions=False,
@@ -1696,7 +1689,7 @@ async def showsetup(
 
 
     # =====================================================
-    # VERIFY = VIEW ONLY
+    # VERIFY PERMISSIONS
     # =====================================================
 
     await verify.set_permissions(
@@ -1713,12 +1706,23 @@ async def showsetup(
 
 
     # =====================================================
-    # GENERAL = VERIFIED ONLY
+    # WELCOME
+    # =====================================================
+
+    await welcome.set_permissions(
+        everyone,
+        view_channel=True,
+        send_messages=False,
+        add_reactions=False
+    )
+
+
+    # =====================================================
+    # GENERAL
     # =====================================================
 
     await general.set_permissions(
         everyone,
-
         view_channel=False,
         send_messages=False
     )
@@ -1732,6 +1736,7 @@ async def showsetup(
 
         attach_files=False,
         embed_links=False,
+
         add_reactions=False,
 
         create_public_threads=False,
@@ -1743,20 +1748,24 @@ async def showsetup(
 
 
     await general.edit(
-        slowmode_delay=GENERAL_SLOWMODE
+        slowmode_delay=GENERAL_SLOWMODE_SECONDS
     )
 
 
     # =====================================================
-    # SHARED MODS = VERIFIED ONLY
+    # SHARED MODS
     # =====================================================
+    #
+    # Users DO NOT create posts directly.
+    # Approved submissions are published by the bot.
+    #
 
     await shared_mods.set_permissions(
         everyone,
 
         view_channel=False,
-        send_messages=False,
-        create_public_threads=False
+        create_public_threads=False,
+        send_messages=False
     )
 
 
@@ -1764,36 +1773,1056 @@ async def showsetup(
         verified,
 
         view_channel=True,
+
+        create_public_threads=False,
+
         send_messages=True,
-        create_public_threads=True,
         send_messages_in_threads=True,
 
-        attach_files=True,
-        embed_links=False,
+        attach_files=False,
 
         read_message_history=True
     )
 
 
-    await shared_mods.edit(
-        slowmode_delay=MOD_POST_COOLDOWN,
+    # =====================================================
+    # SUGGESTIONS
+    # =====================================================
 
-        default_thread_slowmode_delay=MOD_COMMENT_SLOWMODE
+    await suggestions.set_permissions(
+        everyone,
+        view_channel=False
+    )
+
+
+    await suggestions.set_permissions(
+        verified,
+
+        view_channel=True,
+
+        create_public_threads=True,
+
+        send_messages=True,
+        send_messages_in_threads=True,
+
+        attach_files=False,
+
+        read_message_history=True
+    )
+
+
+    # =====================================================
+    # MOD LOGS + MOD REVIEW PRIVATE
+    # =====================================================
+
+    await mod_logs.set_permissions(
+        everyone,
+        view_channel=False
+    )
+
+
+    await verified.set_permissions if False else asyncio.sleep(0)
+
+
+    await mod_review.set_permissions(
+        everyone,
+        view_channel=False
+    )
+
+
+    # =====================================================
+    # INITIAL POSTS
+    # =====================================================
+
+    if not [
+        message
+        async for message in rules.history(
+            limit=1
+        )
+    ]:
+
+        rules_embed = discord.Embed(
+            title="📜 SSP Modding Hub Rules",
+            description=(
+                "• No spam\n"
+                "• No mass pings\n"
+                "• No links, GIFs, files, or Discord invites in General\n"
+                "• No harassment or slurs\n"
+                "• Be respectful\n"
+                "• Follow Discord's rules\n\n"
+                "💬 General has a **10-second cooldown**.\n\n"
+                "🧩 Mods must be submitted with `/submitmod` "
+                "and approved by staff before appearing in Shared Mods."
+            ),
+            color=discord.Color.blue()
+        )
+
+
+        await rules.send(
+            embed=rules_embed
+        )
+
+
+    if not [
+        message
+        async for message in verify.history(
+            limit=1
+        )
+    ]:
+
+        verify_embed = discord.Embed(
+            title="✅ Verification",
+            description=(
+                "Press **✅ Verify** below.\n\n"
+                "After verification you unlock:\n"
+                "💬 General\n"
+                "🧩 Shared Mods\n"
+                "💡 Suggestions"
+            ),
+            color=discord.Color.green()
+        )
+
+
+        await verify.send(
+            embed=verify_embed,
+            view=VerifyView()
+        )
+
+
+    await interaction.followup.send(
+        (
+            "✅ **Setup/update complete!**\n\n"
+            "Added/updated:\n"
+            "📜 Rules\n"
+            "✅ Verification\n"
+            "👋 Welcome\n"
+            "💬 General\n"
+            "🧩 Shared Mods\n"
+            "💡 Suggestions\n"
+            "🛡️ Mod Logs\n"
+            "🔎 Mod Review"
+        ),
+        ephemeral=True
+    )
+
+
+# =========================================================
+# /SUBMITMOD
+# =========================================================
+
+@tree.command(
+    name="submitmod",
+    description="Submit a mod for staff approval"
+)
+@app_commands.describe(
+    name="Name of the mod",
+    file="Upload exactly one mod file",
+    description="Short description of the mod"
+)
+async def submitmod(
+    interaction,
+    name: str,
+    file: discord.Attachment,
+    description: str = "No description provided"
+):
+
+    guild = interaction.guild
+
+    if guild is None:
+        return
+
+
+    member = interaction.user
+
+
+    if not isinstance(
+        member,
+        discord.Member
+    ):
+
+        return
+
+
+    verified = discord.utils.get(
+        guild.roles,
+        name=VERIFIED_ROLE_NAME
+    )
+
+
+    if (
+        verified is None
+        or verified not in member.roles
+    ):
+
+        await interaction.response.send_message(
+            "❌ You must be verified first.",
+            ephemeral=True
+        )
+
+        return
+
+
+    # =====================================================
+    # FILE TYPE
+    # =====================================================
+
+    if not allowed_mod_file(
+        file.filename
+    ):
+
+        allowed = ", ".join(
+            sorted(
+                ALLOWED_MOD_EXTENSIONS
+            )
+        )
+
+        await interaction.response.send_message(
+            (
+                "❌ That file type is not allowed.\n\n"
+                f"Allowed: `{allowed}`"
+            ),
+            ephemeral=True
+        )
+
+        return
+
+
+    # =====================================================
+    # 10 MINUTE SUBMISSION COOLDOWN
+    # =====================================================
+
+    last_submit = get_mod_cooldown(
+        guild.id,
+        member.id
+    )
+
+
+    if last_submit:
+
+        next_allowed = last_submit + timedelta(
+            seconds=MOD_SUBMIT_COOLDOWN_SECONDS
+        )
+
+
+        if discord.utils.utcnow() < next_allowed:
+
+            remaining = (
+                next_allowed
+                - discord.utils.utcnow()
+            )
+
+            seconds = int(
+                remaining.total_seconds()
+            )
+
+            await interaction.response.send_message(
+                (
+                    "⏱️ You can only submit one mod "
+                    "every **10 minutes**.\n\n"
+                    f"Try again in about `{seconds}` seconds."
+                ),
+                ephemeral=True
+            )
+
+            return
+
+
+    review_channel = discord.utils.get(
+        guild.text_channels,
+        name=MOD_REVIEW_CHANNEL_NAME
+    )
+
+
+    if review_channel is None:
+
+        await interaction.response.send_message(
+            "❌ Mod Review channel is missing. Ask an admin to run `/setup`.",
+            ephemeral=True
+        )
+
+        return
+
+
+    await interaction.response.defer(
+        ephemeral=True
+    )
+
+
+    try:
+
+        uploaded_file = await file.to_file()
+
+    except Exception:
+
+        await interaction.followup.send(
+            "❌ I couldn't read that file.",
+            ephemeral=True
+        )
+
+        return
+
+
+    embed = discord.Embed(
+        title="🔎 New Mod Submission",
+        description=(
+            f"**Mod:** {name}\n\n"
+            f"**Description:**\n{description}\n\n"
+            f"**Submitted by:** {member.mention}\n"
+            f"**User ID:** `{member.id}`"
+        ),
+        color=discord.Color.yellow(),
+        timestamp=discord.utils.utcnow()
+    )
+
+
+    review_message = await review_channel.send(
+        embed=embed,
+        file=uploaded_file
+    )
+
+
+    await review_message.edit(
+        content=(
+            f"SUBMISSION_USER_ID={member.id}\n"
+            f"SUBMISSION_NAME={name}"
+        )
+    )
+
+
+    set_mod_cooldown(
+        guild.id,
+        member.id
+    )
+
+
+    await interaction.followup.send(
+        (
+            "✅ Your mod has been submitted for staff review.\n\n"
+            "It will only appear in Shared Mods if staff approves it."
+        ),
+        ephemeral=True
+    )
+
+
+# =========================================================
+# /APPROVEMOD
+# =========================================================
+
+@tree.command(
+    name="approvemod",
+    description="Approve a mod submission"
+)
+@app_commands.describe(
+    message_id="Message ID from the private Mod Review channel"
+)
+@app_commands.checks.has_permissions(
+    manage_messages=True
+)
+async def approvemod(
+    interaction,
+    message_id: str
+):
+
+    guild = interaction.guild
+
+    if guild is None:
+        return
+
+
+    review_channel = discord.utils.get(
+        guild.text_channels,
+        name=MOD_REVIEW_CHANNEL_NAME
+    )
+
+
+    shared_mods = discord.utils.get(
+        guild.forums,
+        name=SHARED_MODS_NAME
+    )
+
+
+    if (
+        review_channel is None
+        or shared_mods is None
+    ):
+
+        await interaction.response.send_message(
+            "❌ Setup is missing.",
+            ephemeral=True
+        )
+
+        return
+
+
+    try:
+
+        review_message = await review_channel.fetch_message(
+            int(message_id)
+        )
+
+    except Exception:
+
+        await interaction.response.send_message(
+            "❌ I couldn't find that review message.",
+            ephemeral=True
+        )
+
+        return
+
+
+    if not review_message.attachments:
+
+        await interaction.response.send_message(
+            "❌ That submission has no file.",
+            ephemeral=True
+        )
+
+        return
+
+
+    # =====================================================
+    # READ NAME / USER
+    # =====================================================
+
+    content = review_message.content or ""
+
+    user_match = re.search(
+        r"SUBMISSION_USER_ID=(\d+)",
+        content
+    )
+
+    name_match = re.search(
+        r"SUBMISSION_NAME=(.+)",
+        content
+    )
+
+
+    if not user_match:
+
+        await interaction.response.send_message(
+            "❌ Couldn't find submitter information.",
+            ephemeral=True
+        )
+
+        return
+
+
+    submitter_id = int(
+        user_match.group(1)
+    )
+
+
+    mod_name = (
+        name_match.group(1)
+        if name_match
+        else "Approved Mod"
+    )
+
+
+    attachment = review_message.attachments[0]
+
+
+    await interaction.response.defer(
+        ephemeral=True
+    )
+
+
+    try:
+
+        mod_file = await attachment.to_file()
+
+
+        thread_with_message = await shared_mods.create_thread(
+            name=mod_name[:100],
+
+            content=(
+                "⚠️ **COMMUNITY MOD — USE AT YOUR OWN RISK**\n\n"
+                f"Submitted by <@{submitter_id}>.\n"
+                f"Approved by {interaction.user.mention}.\n\n"
+                "SSP Modding Hub does not guarantee that "
+                "community-uploaded files are safe."
+            ),
+
+            file=mod_file,
+
+            slowmode_delay=SHARED_MOD_COMMENT_SLOWMODE
+        )
+
+
+        try:
+
+            thread = thread_with_message.thread
+
+        except AttributeError:
+
+            thread = thread_with_message
+
+
+        embed = review_message.embeds[0] if review_message.embeds else None
+
+
+        if embed:
+
+            embed.color = discord.Color.green()
+
+            embed.add_field(
+                name="Status",
+                value=(
+                    f"✅ Approved by {interaction.user.mention}"
+                ),
+                inline=False
+            )
+
+
+            await review_message.edit(
+                embed=embed
+            )
+
+
+        member = guild.get_member(
+            submitter_id
+        )
+
+
+        if member:
+
+            try:
+
+                await member.send(
+                    (
+                        f"✅ Your mod **{mod_name}** was approved "
+                        f"in **{guild.name}**!"
+                    )
+                )
+
+            except Exception:
+
+                pass
+
+
+        await mod_log(
+            guild,
+            "✅ Mod Approved",
+            (
+                f"Mod: **{mod_name}**\n"
+                f"Submitter: <@{submitter_id}>\n"
+                f"Approved by: {interaction.user.mention}"
+            ),
+            discord.Color.green()
+        )
+
+
+        await interaction.followup.send(
+            (
+                f"✅ **{mod_name}** has been published "
+                "to Shared Mods."
+            ),
+            ephemeral=True
+        )
+
+
+    except Exception as error:
+
+        print(
+            "APPROVE ERROR:",
+            repr(error)
+        )
+
+
+        await interaction.followup.send(
+            (
+                "❌ Couldn't publish the mod.\n"
+                "Check Railway logs for the exact error."
+            ),
+            ephemeral=True
+        )
+
+
+# =========================================================
+# /REJECTMOD
+# =========================================================
+
+@tree.command(
+    name="rejectmod",
+    description="Reject a mod submission"
+)
+@app_commands.describe(
+    message_id="Message ID from Mod Review",
+    reason="Why the mod was rejected"
+)
+@app_commands.checks.has_permissions(
+    manage_messages=True
+)
+async def rejectmod(
+    interaction,
+    message_id: str,
+    reason: str
+):
+
+    guild = interaction.guild
+
+    review_channel = discord.utils.get(
+        guild.text_channels,
+        name=MOD_REVIEW_CHANNEL_NAME
+    )
+
+
+    if review_channel is None:
+
+        await interaction.response.send_message(
+            "❌ Mod Review channel missing.",
+            ephemeral=True
+        )
+
+        return
+
+
+    try:
+
+        message = await review_channel.fetch_message(
+            int(message_id)
+        )
+
+    except Exception:
+
+        await interaction.response.send_message(
+            "❌ Submission not found.",
+            ephemeral=True
+        )
+
+        return
+
+
+    user_match = re.search(
+        r"SUBMISSION_USER_ID=(\d+)",
+        message.content or ""
+    )
+
+
+    name_match = re.search(
+        r"SUBMISSION_NAME=(.+)",
+        message.content or ""
+    )
+
+
+    submitter_id = (
+        int(user_match.group(1))
+        if user_match
+        else None
+    )
+
+
+    mod_name = (
+        name_match.group(1)
+        if name_match
+        else "Mod"
+    )
+
+
+    if message.embeds:
+
+        embed = message.embeds[0]
+
+        embed.color = discord.Color.red()
+
+        embed.add_field(
+            name="Status",
+            value=(
+                f"❌ Rejected by {interaction.user.mention}\n"
+                f"Reason: {reason}"
+            ),
+            inline=False
+        )
+
+
+        await message.edit(
+            embed=embed
+        )
+
+
+    if submitter_id:
+
+        member = guild.get_member(
+            submitter_id
+        )
+
+
+        if member:
+
+            try:
+
+                await member.send(
+                    (
+                        f"❌ Your mod **{mod_name}** was rejected.\n\n"
+                        f"Reason: {reason}"
+                    )
+                )
+
+            except Exception:
+
+                pass
+
+
+    await mod_log(
+        guild,
+        "❌ Mod Rejected",
+        (
+            f"Mod: **{mod_name}**\n"
+            f"Reason: {reason}\n"
+            f"Rejected by: {interaction.user.mention}"
+        ),
+        discord.Color.red()
+    )
+
+
+    await interaction.response.send_message(
+        "❌ Mod rejected.",
+        ephemeral=True
+    )
+
+
+# =========================================================
+# /WARN
+# =========================================================
+
+@tree.command(
+    name="warn",
+    description="Warn a member"
+)
+@app_commands.describe(
+    member="Member to warn",
+    reason="Reason for warning"
+)
+@app_commands.checks.has_permissions(
+    manage_messages=True
+)
+async def warn(
+    interaction,
+    member: discord.Member,
+    reason: str
+):
+
+    add_user_warning(
+        interaction.guild.id,
+        member.id,
+        interaction.user.id,
+        reason
+    )
+
+
+    count = len(
+        get_user_warnings(
+            interaction.guild.id,
+            member.id
+        )
+    )
+
+
+    try:
+
+        await member.send(
+            (
+                f"⚠️ You were warned in "
+                f"**{interaction.guild.name}**.\n\n"
+                f"Reason: {reason}\n"
+                f"Total warnings: {count}"
+            )
+        )
+
+    except Exception:
+
+        pass
+
+
+    await mod_log(
+        interaction.guild,
+        "⚠️ Member Warned",
+        (
+            f"Member: {member.mention}\n"
+            f"Moderator: {interaction.user.mention}\n"
+            f"Reason: {reason}\n"
+            f"Warnings: {count}"
+        )
     )
 
 
     await interaction.response.send_message(
         (
-            "✅ Verification is open.\n\n"
-
-            "Before verification:\n"
-            "📜 Rules\n"
-            "✅ Verification\n\n"
-
-            "After verification:\n"
-            "💬 General\n"
-            "🧩 Shared Mods"
+            f"⚠️ Warned {member.mention}.\n"
+            f"They now have **{count}** warning(s)."
         ),
+        ephemeral=True
+    )
+
+
+# =========================================================
+# /WARNINGS
+# =========================================================
+
+@tree.command(
+    name="warnings",
+    description="Check a member's warnings"
+)
+@app_commands.describe(
+    member="Member to check"
+)
+@app_commands.checks.has_permissions(
+    manage_messages=True
+)
+async def warnings(
+    interaction,
+    member: discord.Member
+):
+
+    records = get_user_warnings(
+        interaction.guild.id,
+        member.id
+    )
+
+
+    if not records:
+
+        await interaction.response.send_message(
+            f"✅ {member.mention} has no warnings.",
+            ephemeral=True
+        )
+
+        return
+
+
+    lines = []
+
+
+    for index, record in enumerate(
+        records,
+        start=1
+    ):
+
+        lines.append(
+            (
+                f"**{index}.** {record.get('reason', 'No reason')}\n"
+                f"Moderator: <@{record.get('moderator')}>"
+            )
+        )
+
+
+    embed = discord.Embed(
+        title=f"⚠️ Warnings — {member}",
+        description="\n\n".join(lines),
+        color=discord.Color.orange()
+    )
+
+
+    await interaction.response.send_message(
+        embed=embed,
+        ephemeral=True
+    )
+
+
+# =========================================================
+# /CLEARWARNINGS
+# =========================================================
+
+@tree.command(
+    name="clearwarnings",
+    description="Clear a member's warnings"
+)
+@app_commands.describe(
+    member="Member whose warnings should be cleared"
+)
+@app_commands.checks.has_permissions(
+    manage_messages=True
+)
+async def clearwarnings(
+    interaction,
+    member: discord.Member
+):
+
+    clear_user_warnings(
+        interaction.guild.id,
+        member.id
+    )
+
+
+    await mod_log(
+        interaction.guild,
+        "🧹 Warnings Cleared",
+        (
+            f"Member: {member.mention}\n"
+            f"Moderator: {interaction.user.mention}"
+        )
+    )
+
+
+    await interaction.response.send_message(
+        f"✅ Cleared warnings for {member.mention}.",
+        ephemeral=True
+    )
+
+
+# =========================================================
+# /TIMEOUT
+# =========================================================
+
+@tree.command(
+    name="timeout",
+    description="Timeout a member"
+)
+@app_commands.describe(
+    member="Member to timeout",
+    minutes="Number of minutes",
+    reason="Reason"
+)
+@app_commands.checks.has_permissions(
+    moderate_members=True
+)
+async def timeout_command(
+    interaction,
+    member: discord.Member,
+    minutes: app_commands.Range[int, 1, 40320],
+    reason: str = "No reason provided"
+):
+
+    try:
+
+        await member.timeout(
+            timedelta(
+                minutes=minutes
+            ),
+            reason=reason
+        )
+
+
+        await mod_log(
+            interaction.guild,
+            "⏱️ Manual Timeout",
+            (
+                f"Member: {member.mention}\n"
+                f"Moderator: {interaction.user.mention}\n"
+                f"Length: {minutes} minutes\n"
+                f"Reason: {reason}"
+            )
+        )
+
+
+        await interaction.response.send_message(
+            (
+                f"✅ Timed out {member.mention} "
+                f"for **{minutes} minutes**."
+            ),
+            ephemeral=True
+        )
+
+
+    except discord.Forbidden:
+
+        await interaction.response.send_message(
+            "❌ I cannot timeout that member.",
+            ephemeral=True
+        )
+
+
+# =========================================================
+# /BAN
+# =========================================================
+
+@tree.command(
+    name="ban",
+    description="Ban a member"
+)
+@app_commands.describe(
+    member="Member to ban",
+    reason="Reason"
+)
+@app_commands.checks.has_permissions(
+    ban_members=True
+)
+async def ban(
+    interaction,
+    member: discord.Member,
+    reason: str = "No reason provided"
+):
+
+    try:
+
+        await member.ban(
+            reason=reason
+        )
+
+
+        await mod_log(
+            interaction.guild,
+            "🔨 Member Banned",
+            (
+                f"Member: {member}\n"
+                f"Moderator: {interaction.user.mention}\n"
+                f"Reason: {reason}"
+            ),
+            discord.Color.red()
+        )
+
+
+        await interaction.response.send_message(
+            f"🔨 Banned **{member}**.",
+            ephemeral=True
+        )
+
+
+    except discord.Forbidden:
+
+        await interaction.response.send_message(
+            "❌ I cannot ban that member.",
+            ephemeral=True
+        )
+
+
+# =========================================================
+# /PURGE
+# =========================================================
+
+@tree.command(
+    name="purge",
+    description="Delete multiple messages"
+)
+@app_commands.describe(
+    amount="Number of messages to delete"
+)
+@app_commands.checks.has_permissions(
+    manage_messages=True
+)
+async def purge(
+    interaction,
+    amount: app_commands.Range[int, 1, 100]
+):
+
+    channel = interaction.channel
+
+
+    if not isinstance(
+        channel,
+        discord.TextChannel
+    ):
+
+        await interaction.response.send_message(
+            "❌ Use this in a normal text channel.",
+            ephemeral=True
+        )
+
+        return
+
+
+    await interaction.response.defer(
+        ephemeral=True
+    )
+
+
+    deleted = await channel.purge(
+        limit=amount
+    )
+
+
+    await interaction.followup.send(
+        f"🧹 Deleted **{len(deleted)}** messages.",
         ephemeral=True
     )
 
@@ -1804,7 +2833,7 @@ async def showsetup(
 
 @tree.command(
     name="lockdown",
-    description="Lock general during a raid"
+    description="Lock General and verification"
 )
 @app_commands.checks.has_permissions(
     administrator=True
@@ -1815,53 +2844,54 @@ async def lockdown(
 
     guild = interaction.guild
 
-
-    general = discord.utils.get(
-        guild.text_channels,
-        name=GENERAL_CHANNEL
-    )
-
-
-    verified = discord.utils.get(
-        guild.roles,
-        name=VERIFIED_ROLE
-    )
-
-
-    if (
-        general is None
-        or verified is None
-    ):
-
-        await interaction.response.send_message(
-            "❌ Setup not found.",
-            ephemeral=True
-        )
-
-        return
-
-
     raid_lockdowns.add(
         guild.id
     )
 
 
-    overwrite = general.overwrites_for(
-        verified
+    general = discord.utils.get(
+        guild.text_channels,
+        name=GENERAL_CHANNEL_NAME
     )
 
 
-    overwrite.send_messages = False
+    verified = discord.utils.get(
+        guild.roles,
+        name=VERIFIED_ROLE_NAME
+    )
 
 
-    await general.set_permissions(
-        verified,
-        overwrite=overwrite
+    if (
+        general
+        and verified
+    ):
+
+        overwrite = general.overwrites_for(
+            verified
+        )
+
+        overwrite.send_messages = False
+
+
+        await general.set_permissions(
+            verified,
+            overwrite=overwrite,
+            reason="Manual lockdown"
+        )
+
+
+    await mod_log(
+        guild,
+        "🔒 Manual Lockdown",
+        (
+            f"Started by {interaction.user.mention}"
+        ),
+        discord.Color.red()
     )
 
 
     await interaction.response.send_message(
-        "🔒 General locked.",
+        "🔒 Server verification/general lockdown activated.",
         ephemeral=True
     )
 
@@ -1872,7 +2902,7 @@ async def lockdown(
 
 @tree.command(
     name="unlock",
-    description="Unlock general after a raid"
+    description="Disable raid lockdown"
 )
 @app_commands.checks.has_permissions(
     administrator=True
@@ -1884,56 +2914,59 @@ async def unlock(
     guild = interaction.guild
 
 
-    general = discord.utils.get(
-        guild.text_channels,
-        name=GENERAL_CHANNEL
-    )
-
-
-    verified = discord.utils.get(
-        guild.roles,
-        name=VERIFIED_ROLE
-    )
-
-
-    if (
-        general is None
-        or verified is None
-    ):
-
-        await interaction.response.send_message(
-            "❌ Setup not found.",
-            ephemeral=True
-        )
-
-        return
-
-
     raid_lockdowns.discard(
         guild.id
     )
 
 
-    await general.set_permissions(
-        verified,
+    general = discord.utils.get(
+        guild.text_channels,
+        name=GENERAL_CHANNEL_NAME
+    )
 
-        view_channel=True,
-        send_messages=True,
 
-        attach_files=False,
-        embed_links=False,
-        add_reactions=False,
+    verified = discord.utils.get(
+        guild.roles,
+        name=VERIFIED_ROLE_NAME
+    )
 
-        create_public_threads=False,
-        create_private_threads=False,
-        send_messages_in_threads=False,
 
-        read_message_history=True
+    if (
+        general
+        and verified
+    ):
+
+        await general.set_permissions(
+            verified,
+
+            view_channel=True,
+            send_messages=True,
+
+            attach_files=False,
+            embed_links=False,
+
+            add_reactions=False,
+
+            create_public_threads=False,
+            create_private_threads=False,
+            send_messages_in_threads=False,
+
+            read_message_history=True
+        )
+
+
+    await mod_log(
+        guild,
+        "🔓 Lockdown Disabled",
+        (
+            f"Disabled by {interaction.user.mention}"
+        ),
+        discord.Color.green()
     )
 
 
     await interaction.response.send_message(
-        "🔓 General unlocked.",
+        "🔓 Raid lockdown disabled.",
         ephemeral=True
     )
 
@@ -1944,7 +2977,7 @@ async def unlock(
 
 @tree.command(
     name="unverify",
-    description="Remove verification from a member"
+    description="Remove Verified from a member"
 )
 @app_commands.describe(
     member="Member to unverify"
@@ -1957,59 +2990,49 @@ async def unverify(
     member: discord.Member
 ):
 
-    guild = interaction.guild
-
-
     role = discord.utils.get(
-        guild.roles,
-        name=VERIFIED_ROLE
+        interaction.guild.roles,
+        name=VERIFIED_ROLE_NAME
     )
 
 
-    if role is None:
+    if (
+        role is None
+        or role not in member.roles
+    ):
 
         await interaction.response.send_message(
-            "❌ Verified role not found.",
+            "⚠️ That member is not verified.",
             ephemeral=True
         )
 
         return
 
 
-    if role not in member.roles:
+    await member.remove_roles(
+        role,
+        reason=f"Unverified by {interaction.user}"
+    )
 
-        await interaction.response.send_message(
-            f"⚠️ {member.mention} is not verified.",
-            ephemeral=True
+
+    await mod_log(
+        interaction.guild,
+        "❌ Member Unverified",
+        (
+            f"Member: {member.mention}\n"
+            f"Moderator: {interaction.user.mention}"
         )
-
-        return
-
-
-    try:
-
-        await member.remove_roles(
-            role,
-            reason=f"Unverified by {interaction.user}"
-        )
+    )
 
 
-        await interaction.response.send_message(
-            f"✅ Removed verification from {member.mention}.",
-            ephemeral=True
-        )
-
-
-    except discord.Forbidden:
-
-        await interaction.response.send_message(
-            "❌ I cannot manage that member.",
-            ephemeral=True
-        )
+    await interaction.response.send_message(
+        f"✅ Removed Verified from {member.mention}.",
+        ephemeral=True
+    )
 
 
 # =========================================================
-# ERRORS
+# COMMAND ERROR HANDLER
 # =========================================================
 
 @tree.error
@@ -2019,9 +3042,9 @@ async def command_error(
 ):
 
     print("")
-    print("================================")
+    print("======================================")
     print("COMMAND ERROR")
-    print("================================")
+    print("======================================")
     print(
         repr(error)
     )
@@ -2038,7 +3061,7 @@ async def command_error(
         )
 
 
-    print("================================")
+    print("======================================")
     print("")
 
 
@@ -2048,7 +3071,7 @@ async def command_error(
     ):
 
         text = (
-            "❌ You need Administrator permission."
+            "❌ You don't have permission to use that command."
         )
 
     else:
@@ -2081,7 +3104,7 @@ async def command_error(
 
 
 # =========================================================
-# START BOT
+# START
 # =========================================================
 
 if __name__ == "__main__":
